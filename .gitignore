@@ -1,3 +1,13 @@
+#eclipse project files:
+/Debug/
+/.cproject
+/.project
+/.settings
+
+
+
+#c .gitignore template below.
+
 # Object files
 *.o
 *.ko
@@ -31,3 +41,4 @@
 # Debug files
 *.dSYM/
 *.su
+
