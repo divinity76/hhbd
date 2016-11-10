@@ -34,8 +34,9 @@
 #include "misc_extra.h"
 #include "hhbd.h"
 int nbd_fd = -1;
-int localrequestsocket = -1;
-int remoterequestsocket = -1;
+int global_localrequestsocket = -1;
+int global_remoterequestsocket = -1;
+//Todo: compile-time htonl & co...
 pthread_mutex_t single_exit_global_cleanup_mutex;
 void exit_global_cleanup(void) {
 	{
@@ -67,16 +68,16 @@ void exit_global_cleanup(void) {
 			myerror(0, errno, "Warning: failed to close the nbd handle!\n");
 		}
 	}
-	if (remoterequestsocket != -1) {
-		if (-1 == close(remoterequestsocket)) {
+	if (global_remoterequestsocket != -1) {
+		if (-1 == close(global_remoterequestsocket)) {
 			myerror(0, errno,
-					"Warning: failed to close the remoterequestsocket!\n");
+					"Warning: failed to close the global_remoterequestsocket!\n");
 		}
 	}
-	if (localrequestsocket != -1) {
-		if (-1 == close(localrequestsocket)) {
+	if (global_localrequestsocket != -1) {
+		if (-1 == close(global_localrequestsocket)) {
 			myerror(0, errno,
-					"Warning: failed to close the localrequestsocket!\n");
+					"Warning: failed to close the global_localrequestsocket!\n");
 		}
 	}
 }
@@ -95,39 +96,39 @@ void shutdown_signal_handler(int sig, siginfo_t *siginfo, void *context) {
 		}
 	}
 	errno = 0;
-	char *issuer_username_;
+	char *issuer_username_buf;
 	struct passwd* info = getpwuid(siginfo->si_uid);
 	if (info && info->pw_name) {
-		issuer_username_ = info->pw_name;
+		issuer_username_buf = info->pw_name;
 	} else {
-		issuer_username_ = emalloc(
+		issuer_username_buf = emalloc(
 				((size_t) snprintf(NULL, 0,
 						"(failed to get username, errno: %i , strerror: %s)",
 						errno, strerror(errno))) + 1);
-		sprintf(issuer_username_,
+		sprintf(issuer_username_buf,
 				"(failed to get username, errno: %i , strerror: %s)",
 				errno, strerror(errno));
 	}
-	char issuer_username[strlen(issuer_username_) + 1];
-	strcpy(issuer_username, issuer_username_);
+	char issuer_username[strlen(issuer_username_buf) + 1];
+	strcpy(issuer_username, issuer_username_buf);
 	if (!info) {
-		free(issuer_username_);
+		free(issuer_username_buf);
 	}
 	///printf("SHUTDOWN SIGNAL!\n");
 	char* warnings_and_errors;
-	char *issuer_exe_ = get_process_name_by_pid((int) siginfo->si_pid,
+	char *issuer_exe_buf = get_process_name_by_pid((int) siginfo->si_pid,
 			&warnings_and_errors);
-	size_t issuer_exe_len = strlen(issuer_exe_);
+	size_t issuer_exe_len = strlen(issuer_exe_buf);
 	if (issuer_exe_len < 1) {
-		free(issuer_exe_);
-		issuer_exe_ = warnings_and_errors;
-		issuer_exe_len = strlen(issuer_exe_);
+		free(issuer_exe_buf);
+		issuer_exe_buf = warnings_and_errors;
+		issuer_exe_len = strlen(issuer_exe_buf);
 	} else {
 		free(warnings_and_errors);
 	}
 	char issuer_exe[issuer_exe_len + 1];
-	strcpy(issuer_exe, issuer_exe_);
-	free(issuer_exe_);
+	strcpy(issuer_exe, issuer_exe_buf);
+	free(issuer_exe_buf);
 	///TODO: figure out why removing the following 3 lines makes it unable to
 	// print shutdown signal info.... which is really weird..
 	fprintf(stderr, "%s", "");
@@ -141,7 +142,7 @@ void shutdown_signal_handler(int sig, siginfo_t *siginfo, void *context) {
 }
 
 pthread_mutex_t nbd_do_it_thread_mutex;
-void* nbd_doit_thread(void* arg) {
+void* nbd_doit_thread(void *arg) {
 	{
 		int err;
 		err = pthread_mutex_trylock(&nbd_do_it_thread_mutex);
@@ -152,9 +153,10 @@ void* nbd_doit_thread(void* arg) {
 		}
 	}
 	installShutdownSignalHandlers();
-	if (unlikely(0 != ioctl(nbd_fd, NBD_SET_SOCK, remoterequestsocket))) {
+	if (unlikely(
+			0 != ioctl(nbd_fd, NBD_SET_SOCK, global_remoterequestsocket))) {
 		myerror(EXIT_FAILURE, errno,
-				"failed to ioctl(nbd_fd, NBD_SET_SOCK, remoterequestsocket) !\n");
+				"failed to ioctl(nbd_fd, NBD_SET_SOCK, global_remoterequestsocket) !\n");
 	}
 	enum {
 		blocksize = 4096, totalsize = blocksize * 1999
@@ -210,38 +212,113 @@ void install_shutdown_signal_handler(const int sig) {
 void installShutdownSignalHandlers(void) {
 #if defined(_POSIX_VERSION)
 #if _POSIX_VERSION>=199009L
-		//daemon mode not supported (yet?)
-		install_shutdown_signal_handler(SIGHUP);
-		install_shutdown_signal_handler(SIGINT);
-		install_shutdown_signal_handler(SIGQUIT);
-		install_shutdown_signal_handler(SIGILL); //?
-		install_shutdown_signal_handler(SIGABRT);
-		install_shutdown_signal_handler(SIGFPE); //?
-		//SIGKILL/SIGSTOP is not catchable anyway
-		install_shutdown_signal_handler(SIGSEGV);		//?
-		install_shutdown_signal_handler(SIGPIPE);		//?
-		install_shutdown_signal_handler(SIGALRM);
-		install_shutdown_signal_handler(SIGTERM);
-		//default action for SIGUSR1/SIGUSR2 is to terminate, so, until i have something better to do with them..
-		install_shutdown_signal_handler(SIGUSR1);
-		install_shutdown_signal_handler(SIGUSR2);
-		//ignored: SIGCHLD
+	//daemon mode not supported (yet?)
+	install_shutdown_signal_handler(SIGHUP);
+	install_shutdown_signal_handler(SIGINT);
+	install_shutdown_signal_handler(SIGQUIT);
+	install_shutdown_signal_handler(SIGILL); //?
+	install_shutdown_signal_handler(SIGABRT);
+	install_shutdown_signal_handler(SIGFPE); //?
+	//SIGKILL/SIGSTOP is not catchable anyway
+	install_shutdown_signal_handler(SIGSEGV);		//?
+	install_shutdown_signal_handler(SIGPIPE);		//?
+	install_shutdown_signal_handler(SIGALRM);
+	install_shutdown_signal_handler(SIGTERM);
+	//default action for SIGUSR1/SIGUSR2 is to terminate, so, until i have something better to do with them..
+	install_shutdown_signal_handler(SIGUSR1);
+	install_shutdown_signal_handler(SIGUSR2);
+	//ignored: SIGCHLD
 #if _POSIX_VERSION >=200112L
-		install_shutdown_signal_handler(SIGBUS);		//?
-		install_shutdown_signal_handler(SIGPOLL);		//?
-		install_shutdown_signal_handler(SIGSYS);		//?
-		install_shutdown_signal_handler(SIGTRAP);		//?
-		//ignored: SIGURG
-		install_shutdown_signal_handler(SIGVTALRM);
-		install_shutdown_signal_handler(SIGXCPU);//not sure this 1 is catchable..
-		install_shutdown_signal_handler(SIGXFSZ);
+	install_shutdown_signal_handler(SIGBUS);		//?
+	install_shutdown_signal_handler(SIGPOLL);		//?
+	install_shutdown_signal_handler(SIGSYS);		//?
+	install_shutdown_signal_handler(SIGTRAP);		//?
+	//ignored: SIGURG
+	install_shutdown_signal_handler(SIGVTALRM);
+	install_shutdown_signal_handler(SIGXCPU);	//not sure this 1 is catchable..
+	install_shutdown_signal_handler(SIGXFSZ);
 #endif
 #endif
 #endif
-		//Now there are more non-standard signals who's default action is to terminate the process
-		// which we probably should look out for, but.... cba now. they shouldn't happen anyway (like some 99% of the list above)
+	//Now there are more non-standard signals who's default action is to terminate the process
+	// which we probably should look out for, but.... cba now. they shouldn't happen anyway (like some 99% of the list above)
 }
-int main(int argc, char* argv[]) {
+pthread_mutex_t process_request_mutex;
+bool is_shutting_down = false;
+void *process_requests(void *unused) {
+	(void) unused;
+	//global variables often cannot be held in cpu registers, and thus are more difficult to optimize.
+	//so, make a local version of it.
+	const int localrequestsocket = global_localrequestsocket;
+	struct nbd_request request;
+	size_t requestdatabufsize = 1;
+	unsigned char *requestdatabuf = emalloc(requestdatabufsize);
+	size_t responsedatabufsize = 1;
+	//i want to write the response in a single write() syscall, so the data buffer has to be right after the reply data
+	// so i can send both the reply metadata and the reply data in a single write() syscall
+	struct nbd_reply *reply = ecalloc(1,
+			sizeof(struct nbd_reply) + (responsedatabufsize));
+	reply->magic = HTONL(NBD_REPLY_MAGIC);
+
+	while (1) {
+		{
+			int err = pthread_mutex_lock(&process_request_mutex);
+			if (unlikely(err != 0)) {
+				myerror(EXIT_FAILURE, err,
+						"Failed to lock process_request_mutex!\n");
+			}
+		}
+		if (unlikely(is_shutting_down)) {
+			break;
+		}
+
+		ssize_t bytes_read = read(localrequestsocket, &request,
+				sizeof(request));
+		if (unlikely(bytes_read != sizeof(request))) {
+			myerror(EXIT_FAILURE, errno,
+					"got invalid request! all requests must be at minimum %zu bytes, but got a request with only %zu bytes!",
+					sizeof(request), bytes_read);
+		}
+		if (unlikely(request.magic!=HTONL(NBD_REQUEST_MAGIC))) {
+			myerror(EXIT_FAILURE, errno,
+					"got invalid request! the request magic contained an invalid value. must be %ul , but got %ul\n",
+					HTONL(NBD_REQUEST_MAGIC), htonl(request.magic));
+		}
+		switch (request.type) {
+		case HTONL(NBD_CMD_READ): {
+			printf("GOT A NBD_CMD_READ REQUEST\n");
+			break;
+		}
+		case HTONL(NBD_CMD_WRITE): {
+			printf("GOT A NBD_CMD_WRITE REQUEST\n");
+			break;
+		}
+		case HTONL(NBD_CMD_DISC): {
+			printf("GOT A NBD_CMD_DISC REQUEST\n");
+			break;
+		}
+		case HTONL(NBD_CMD_FLUSH): {
+			printf("GOT A NBD_CMD_FLUSH REQUEST\n");
+			break;
+		}
+		case HTONL(NBD_CMD_TRIM): {
+			printf("GOT A NBD_CMD_TRIM REQUEST\n");
+			break;
+		}
+		default: {
+			myerror(EXIT_FAILURE, errno,
+					"got a request type i did not understand!: %ul (see the source code for a list of requests i DO understand, in the switch case's)",
+					request.type);
+			UNREACHABLE();
+			break;
+		}
+		}
+
+	}
+	//is_shutting_down is true at this point
+	return NULL;
+}
+int main(int argc, char *argv[]) {
 	installShutdownSignalHandlers();
 	atexit(exit_global_cleanup);
 	{
@@ -261,6 +338,11 @@ int main(int argc, char* argv[]) {
 		if (unlikely(err != 0)) {
 			myerror(EXIT_FAILURE, err,
 					"failed to initialize mutex single_exit_cleanup_mutex!\n");
+		}
+		err = pthread_mutex_init(&process_request_mutex, NULL);
+		if (unlikely(err != 0)) {
+			myerror(EXIT_FAILURE, err,
+					"failed to initialize mutex process_request_mutex!\n");
 		}
 	}
 	if (argc != 3) {
@@ -294,8 +376,8 @@ int main(int argc, char* argv[]) {
 			myerror(EXIT_FAILURE, errno,
 					"Failed to create IPC unix socket pair!! \n");
 		}
-		localrequestsocket = socks[0];
-		remoterequestsocket = socks[1];
+		global_localrequestsocket = socks[0];
+		global_remoterequestsocket = socks[1];
 	}
 	{
 		//optimizeme? doitthread requires a very small stack size, could probably save a few megabytes of ram here.
@@ -326,38 +408,27 @@ int main(int argc, char* argv[]) {
 		}
 	}
 	{
-		//WARNING when changing INIT_PASSWD: PER SPECS, IT MUST BE EXACTLY 8 BYTES LONG.
-		//  because its a big-endian 64bit unsigned integer, really. manually add NULL bytes to it if needed.
-		const char INIT_PASSWD_C[8] = "NBDMAGIC";
-		_Static_assert(sizeof(INIT_PASSWD_C) == 8,
-				"PER SPECS, INIT_PASSWD MUST BE EXACTLY 8 BYTES LONG. because its a big-endian 64bit unsigned integer, really. manually add NULL bytes to it if needed.");
-		//Todo: compile-time htonl & co...
-		const uint64_t INIT_PASSWD = htonll(*(uint64_t* )INIT_PASSWD_C);
-		//_Static_assert(INIT_PASSWD[strlen(INIT_PASSWD)] != '\0',"If you are __SURE__ there is a null terminator, remove this assert. more likely, it is a coding error.");
-		char buf[sizeof(INIT_PASSWD)];
-		ssize_t err = read(localrequestsocket, buf, sizeof(INIT_PASSWD));
-		if (err != sizeof(INIT_PASSWD)) {
-			fprintf(
-			stderr,
-					"Error: need to read %zu bytes for the init password, but could only read %zd bytes. read buffer follows:\n",
-					sizeof(INIT_PASSWD), err);
-			if (err <= -1) {
-				fprintf(
-				stderr,
-						"(buffer not printed because <= -1 was returned, so the buffer probably contains the initial bytes, not what was read)\n");
-			} else {
-				fwrite(buf, 1, MIN((size_t )(err), sizeof(INIT_PASSWD)),
-				stderr);
+		//now to start the worker threads.
+		pthread_t latestworkerthread;
+		printf("starting worker threads... ");
+		fflush(stdout);
+		for (int i = 0; i < workerthreads_num; ++i) {
+			int err = pthread_create(&latestworkerthread, NULL,
+					process_requests,
+					NULL);
+			if (unlikely(err != 0)) {
+				myerror(EXIT_FAILURE, err,
+						"failed to create worker threads! # of threads created before failure: %i",
+						i);
 			}
-			myerror(EXIT_FAILURE, errno, " ");
-		} else {
-			myerror(EXIT_FAILURE, errno, "GOT MESSAGE FROM SERVER!");
 		}
-		//if(memcmp~
+		printf("done.\n");
+		fflush(stdout);
 	}
 
 	printf(
 			"main thread has finished. will sleep until a signal is received. (by issuing pause();...)\n");
 	fflush(stdout);
+	pause();
 	return EXIT_SUCCESS;
 }
