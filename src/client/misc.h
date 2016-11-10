@@ -32,5 +32,7 @@ char *estrdup(const char *s);
 #define MAX(a,b) (((a)>(b))?(a):(b))
 #endif
 
+
+
 #endif /* COMMON_H_ */
 
