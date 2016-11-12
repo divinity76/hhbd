@@ -4,23 +4,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdbool.h>
-#if defined(__GLIBC__)
-#include <execinfo.h>
-#endif
 #include "misc.h"
 
-#if defined(__GLIBC__)
-#define macrobacktrace() { \
-void *array[20]; \
-int traces=backtrace(array,sizeof(array)/sizeof(array[0])); \
-if(traces<=0) { \
-	fprintf(stderr,"failed to get a backtrace!"); \
-} else { \
-backtrace_symbols_fd(array,traces,STDERR_FILENO); \
-} \
-fflush(stderr); \
-}
-#endif
 
 void *emalloc(const size_t size) {
 	void *ret = malloc(size);
@@ -74,6 +59,21 @@ char *estrdup(const char *s) {
 		fprintf(stderr,
 				"strdup failed to copy string, will terminate... string: >>> %s <<< errno: %i strerror: %s.\n",
 				s, errno, strerror(errno));
+#if defined(__GLIBC__)
+		macrobacktrace()
+#endif
+		fflush(stderr);
+		fflush(stdout);
+		exit(EXIT_FAILURE);
+	}
+	return ret;
+}
+FILE *etmpfile() {
+	FILE *ret = tmpfile();
+	if (unlikely(!ret)) {
+		fprintf(stderr,
+				"tmpfile failed to create temporary file, will terminate... errno: %i strerror: %s.\n",
+				errno, strerror(errno));
 #if defined(__GLIBC__)
 		macrobacktrace()
 #endif

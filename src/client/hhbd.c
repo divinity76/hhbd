@@ -11,10 +11,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <error.h>
 #include <err.h>
+#include <errno.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -23,20 +26,68 @@
 #include <linux/nbd.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
-#include <errno.h>
-#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <string.h>
 #include <pwd.h>
+#include <curl/curl.h>
 
 #include "misc.h"
 #include "misc_extra.h"
 #include "hhbd.h"
+#include "ecurl.h"
 int nbd_fd = -1;
 int global_localrequestsocket = -1;
 int global_remoterequestsocket = -1;
-//Todo: compile-time htonl & co...
+bool is_shutting_down = false;
+static size_t num_workerthreads = 0;
+enum blocksizeEnum {
+	blocksize = (uint64_t) 4096
+};
+struct {
+	bool hasinfo;
+	size_t totalsize;
+	char* infourl;
+	char* writeurl;
+	char* readurl;
+} serverinfo = { 0 };
+
+void getServerInfo(const char* infourl) {
+	if (unlikely(serverinfo.hasinfo)) {
+		myerror(EXIT_FAILURE, errno,
+				"changing server at runtime is not supported at this time. code was not written with that in mind, it is probably dangerous.\n");
+	}
+	serverinfo.infourl = estrdup(infourl);
+	CURLcode ret;
+	CURL *curlh = ecurl_easy_init();
+	ecurl_easy_setopt(curlh, CURLOPT_URL, "http://hanstest.ml/dfile/dfile.blob");
+	ecurl_easy_setopt(curlh, CURLOPT_NOPROGRESS, 1L);
+	//ecurl_easy_setopt(curlh, CURLOPT_HEADER, 0L);
+	ecurl_easy_setopt(curlh, CURLOPT_USERAGENT, "curl/7.50.1");
+	ecurl_easy_setopt(curlh, CURLOPT_MAXREDIRS, 50L);
+	//optimize note: tls might make a huge overhead for the workers...
+	ecurl_easy_setopt(curlh, CURLOPT_HTTP_VERSION,
+			(long )CURL_HTTP_VERSION_2TLS);
+	//ecurl_easy_setopt(curlh, CURLOPT_SSH_KNOWNHOSTS, "/root/.ssh/known_hosts");
+	{
+		//unsafe options
+		ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYHOST, 0L);
+		ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYPEER, 0L);
+		ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYSTATUS, 0L);
+	}
+	//ecurl_easy_setopt(curlh, CURLOPT_FILETIME, 1L);
+	//ecurl_easy_setopt(curlh, CURLOPT_TCP_KEEPALIVE, 1L);
+	FILE *result = etmpfile();
+	ecurl_easy_setopt(curlh, CURLOPT_WRITEDATA, result);
+	ret = curl_easy_perform(curlh);
+
+	curl_easy_cleanup(curlh);
+	curlh = NULL;
+
+	//return (int) ret;
+
+}
+
 pthread_mutex_t single_exit_global_cleanup_mutex;
 void exit_global_cleanup(void) {
 	{
@@ -48,8 +99,19 @@ void exit_global_cleanup(void) {
 			return;
 		}
 	}
+
 	printf("shutting down, cleaning up.. thread doing the cleanup: %zu \n",
 			pthread_self());
+	is_shutting_down = true;
+	if (serverinfo.infourl) {
+		free(serverinfo.infourl);
+	}
+	if (serverinfo.readurl) {
+		free(serverinfo.readurl);
+	}
+	if (serverinfo.writeurl) {
+		free(serverinfo.writeurl);
+	}
 	if (nbd_fd != -1) {
 		int err;
 		/*
@@ -80,6 +142,7 @@ void exit_global_cleanup(void) {
 					"Warning: failed to close the global_localrequestsocket!\n");
 		}
 	}
+	curl_global_cleanup();
 }
 pthread_mutex_t recursive_shutdown_signal_protector_mutex;
 
@@ -158,20 +221,18 @@ void* nbd_doit_thread(void *arg) {
 		myerror(EXIT_FAILURE, errno,
 				"failed to ioctl(nbd_fd, NBD_SET_SOCK, global_remoterequestsocket) !\n");
 	}
-	enum {
-		blocksize = 4096, totalsize = blocksize * 1999
-	};
-	_Static_assert(totalsize % blocksize == 0,
-			"the kernel is dividing totalsize by blocksize to get number of sectors. "
-					"if totalsize is not a multiple of blocksize, you are probably doing something wrong!!!");
+//	_Static_assert(totalsize % blocksize == 0,
+//			"the kernel is dividing totalsize by blocksize to get number of sectors. "
+//					"if totalsize is not a multiple of blocksize, you are probably doing something wrong!!!");
 	//TODO: check, is 4096 the max block size?
 	if (unlikely(0 != ioctl(nbd_fd, NBD_SET_BLKSIZE, blocksize))) { //should check if higher is possible too...
 		myerror(EXIT_FAILURE, errno,
 				"failed to ioctl(nbd_fd, NBD_SET_BLKSIZE, %i) !\n", blocksize);
 	}
-	if (unlikely(0 != ioctl(nbd_fd, NBD_SET_SIZE, totalsize))) { //should check if higher is possible too...
+	if (unlikely(0 != ioctl(nbd_fd, NBD_SET_SIZE, serverinfo.totalsize))) { //should check if higher is possible too...
 		myerror(EXIT_FAILURE, errno,
-				"failed to ioctl(nbd_fd, NBD_SET_SIZE:, %i) !\n", totalsize);
+				"failed to ioctl(nbd_fd, NBD_SET_SIZE:, %zu) !\n",
+				serverinfo.totalsize);
 	}
 
 	//TODO: figure out what NBD_SET_SIZE_BLOCKS is for..
@@ -243,84 +304,204 @@ void installShutdownSignalHandlers(void) {
 	//Now there are more non-standard signals who's default action is to terminate the process
 	// which we probably should look out for, but.... cba now. they shouldn't happen anyway (like some 99% of the list above)
 }
+//this 1 must be packed. (because i'm sending it all in a single write())
+struct myreply {
+	struct nbd_reply nbdreply;
+	char buffer[blocksize];
+}__attribute((packed));
+//this 1 does not need to be packed.
+struct myrequest {
+	struct nbd_request nbdrequest;
+	char buffer[blocksize];
+};
+void print_request_data(struct myrequest *request) {
+	printf("request->magic: %i\n", ntohl(request->nbdrequest.magic));
+	printf("request->type: %i\n", ntohl(request->nbdrequest.type));
+	printf("request->handle: %zu\n",
+			ntohll(*(uint64_t*) request->nbdrequest.handle));
+	printf("request->from: %zu\n", ntohll(request->nbdrequest.from));
+	printf("request->len: %ul\n", ntohl(request->nbdrequest.len));
+}
+
+ssize_t ewrite(const int fd, const void *buf, const size_t count) {
+	const ssize_t ret = write(fd, buf, count);
+	if (unlikely(ret != (ssize_t )count)) {
+		myerror(EXIT_FAILURE, errno,
+				"failed to write() all data! tried to write %zu bytes, but could only write %zd bytes!",
+				count, ret);
+	}
+	return ret;
+}
+
 pthread_mutex_t process_request_mutex;
-bool is_shutting_down = false;
 void *process_requests(void *unused) {
 	(void) unused;
 	//global variables often cannot be held in cpu registers, and thus are more difficult to optimize.
-	//so, make a local version of it.
+	//so, make a local copy of it.
 	const int localrequestsocket = global_localrequestsocket;
-	struct nbd_request request;
-	size_t requestdatabufsize = 1;
-	unsigned char *requestdatabuf = emalloc(requestdatabufsize);
-	size_t responsedatabufsize = 1;
-	//i want to write the response in a single write() syscall, so the data buffer has to be right after the reply data
-	// so i can send both the reply metadata and the reply data in a single write() syscall
-	struct nbd_reply *reply = ecalloc(1,
-			sizeof(struct nbd_reply) + (responsedatabufsize));
-	reply->magic = HTONL(NBD_REPLY_MAGIC);
-
+	//optimization note: add POSIX_MADV_SEQUENTIAL to request.buffer and reply?
+	struct myrequest request = { 0 };
+	struct myreply reply = { 0 };
+	reply.nbdreply.magic = HTONL(NBD_REPLY_MAGIC);
+	++num_workerthreads;
 	while (1) {
 		{
+			if (unlikely(is_shutting_down)) {
+				break;
+			}
 			int err = pthread_mutex_lock(&process_request_mutex);
 			if (unlikely(err != 0)) {
 				myerror(EXIT_FAILURE, err,
 						"Failed to lock process_request_mutex!\n");
 			}
+			if (unlikely(is_shutting_down)) {
+				int err = pthread_mutex_unlock(&process_request_mutex);
+				if (unlikely(err != 0)) {
+					myerror(EXIT_FAILURE, err,
+							"Failed to unlock process_request_mutex!\n");
+				}
+				break;
+			}
 		}
+		ssize_t bytes_read = recv(localrequestsocket, &request.nbdrequest,
+				sizeof(request.nbdrequest), MSG_WAITALL);	//FIXME: NULL //
 		if (unlikely(is_shutting_down)) {
+			int err = pthread_mutex_unlock(&process_request_mutex);
+			if (unlikely(err != 0)) {
+				myerror(EXIT_FAILURE, err,
+						"Failed to unlock process_request_mutex!\n");
+			}
 			break;
 		}
-
-		ssize_t bytes_read = read(localrequestsocket, &request,
-				sizeof(request));
-		if (unlikely(bytes_read != sizeof(request))) {
-			myerror(EXIT_FAILURE, errno,
-					"got invalid request! all requests must be at minimum %zu bytes, but got a request with only %zu bytes!",
-					sizeof(request), bytes_read);
+		if (unlikely(bytes_read != sizeof(request.nbdrequest))) {
+			myerror(0, errno,
+					"got invalid request! all requests must be at minimum %zu bytes, but got a request with only %zu bytes! reply bytes follow: ",
+					sizeof(request.nbdrequest), bytes_read);
+			if (bytes_read <= 0) {
+				fprintf(stderr,
+						"(not printed because the read size was <=0)\n");
+			} else {
+				fwrite(&request.nbdrequest, (size_t) bytes_read, 1, stderr);
+			}
+			fflush(stdout);
+			fflush(stderr);
+			exit(EXIT_FAILURE);
 		}
-		if (unlikely(request.magic!=HTONL(NBD_REQUEST_MAGIC))) {
+		if (unlikely(request.nbdrequest.magic!=HTONL(NBD_REQUEST_MAGIC))) {
 			myerror(EXIT_FAILURE, errno,
 					"got invalid request! the request magic contained an invalid value. must be %ul , but got %ul\n",
-					HTONL(NBD_REQUEST_MAGIC), htonl(request.magic));
+					HTONL(NBD_REQUEST_MAGIC), htonl(request.nbdrequest.magic));
 		}
-		switch (request.type) {
+		if (request.nbdrequest.type != HTONL(NBD_CMD_WRITE)) {
+			//let another thread read new requests ASAP..
+			int err = pthread_mutex_unlock(&process_request_mutex);
+			if (unlikely(err != 0)) {
+				myerror(EXIT_FAILURE, err,
+						"Failed to unlock process_request_mutex!\n");
+			}
+		}
+		switch (request.nbdrequest.type) {
 		case HTONL(NBD_CMD_READ): {
+#ifdef DEBUG
 			printf("GOT A NBD_CMD_READ REQUEST\n");
+			print_request_data(&request);
+#endif
+			request.nbdrequest.len = ntohl(request.nbdrequest.len);
+			if (unlikely(request.nbdrequest.len > blocksize)) {
+				myerror(EXIT_FAILURE, errno,
+						"got a (read) request bigger than blocksize! blocksize: %i. requestsize: %ul.\n",
+						blocksize, request.nbdrequest.len);
+			}
 			break;
 		}
 		case HTONL(NBD_CMD_WRITE): {
+#ifdef DEBUG
 			printf("GOT A NBD_CMD_WRITE REQUEST\n");
+			print_request_data(&request);
+#endif
+			request.nbdrequest.len = ntohl(request.nbdrequest.len);
+			if (unlikely(request.nbdrequest.len > blocksize)) {
+				myerror(EXIT_FAILURE, errno,
+						"got a (write) request bigger than blocksize! blocksize: %i. requestsize: %ul.\n",
+						blocksize, request.nbdrequest.len);
+			}
+			ssize_t bytes_read = recv(localrequestsocket, request.buffer,
+					request.nbdrequest.len, MSG_WAITALL);
+			if (unlikely(bytes_read != request.nbdrequest.len)) {
+				myerror(0, errno,
+						"failed to read all the bytes of a WRITE request! the server said the request was %i bytes long, but could only read %zd bytes. read bytes follow:\n",
+						request.nbdrequest.len, bytes_read);
+				if (bytes_read <= 0) {
+					fprintf(stderr,
+							"(not printed because the read size was <=0)\n");
+				} else {
+					fwrite(&request.buffer, (size_t) bytes_read, 1, stderr);
+				}
+				fflush(stdout);
+				fflush(stderr);
+				exit(EXIT_FAILURE);
+			}
+			//let another thread read for new requests now.
+			{
+				int err = pthread_mutex_unlock(&process_request_mutex);
+				if (unlikely(err != 0)) {
+					myerror(EXIT_FAILURE, err,
+							"Failed to unlock process_request_mutex!\n");
+				}
+			}
 			break;
 		}
 		case HTONL(NBD_CMD_DISC): {
+#ifdef DEBUG
 			printf("GOT A NBD_CMD_DISC REQUEST\n");
+			print_request_data(&request);
+#endif
+			//this is a disconnect request..
+			//there is no reply to NBD_CMD_DISC...
 			break;
 		}
 		case HTONL(NBD_CMD_FLUSH): {
+#ifdef DEBUG
 			printf("GOT A NBD_CMD_FLUSH REQUEST\n");
+			print_request_data(&request);
+#endif
+			reply.nbdreply.error = 0;
+			*(uint64_t*) reply.nbdreply.handle =
+					*(uint64_t*) request.nbdrequest.handle;
+			ewrite(localrequestsocket, &reply.nbdreply, sizeof(reply.nbdreply));
 			break;
 		}
 		case HTONL(NBD_CMD_TRIM): {
+#ifdef DEBUG
 			printf("GOT A NBD_CMD_TRIM REQUEST\n");
+			print_request_data(&request);
+#endif
 			break;
 		}
 		default: {
+			print_request_data(&request);
 			myerror(EXIT_FAILURE, errno,
 					"got a request type i did not understand!: %ul (see the source code for a list of requests i DO understand, in the switch case's)",
-					request.type);
+					request.nbdrequest.type);
 			UNREACHABLE();
 			break;
 		}
 		}
-
 	}
 	//is_shutting_down is true at this point
+	--num_workerthreads;
 	return NULL;
 }
 int main(int argc, char *argv[]) {
+	{
+		CURLcode err = curl_global_init(CURL_GLOBAL_DEFAULT);
+		if (unlikely(err != 0)) {
+			myerror(EXIT_FAILURE, err, "curl_global_init failed!");
+		}
+	}
 	installShutdownSignalHandlers();
 	atexit(exit_global_cleanup);
+
 	{
 		int err;
 		err = pthread_mutex_init(&nbd_do_it_thread_mutex, NULL);
@@ -345,9 +526,9 @@ int main(int argc, char *argv[]) {
 					"failed to initialize mutex process_request_mutex!\n");
 		}
 	}
-	if (argc != 3) {
+	if (argc != 4) {
 		myerror(EXIT_FAILURE, EINVAL,
-				"wrong number of input arguments.\n need 2, got %i\n usage: %s /dev/nbdX number_of_threads\n",
+				"wrong number of input arguments.\n need 3, got %i\n usage: %s /dev/nbdX number_of_threads http://example.org/foo/serverinfo.php\n",
 				argc - 1, argv[0]);
 	}
 	nbd_fd = open(argv[1], O_RDWR);
@@ -369,6 +550,7 @@ int main(int argc, char *argv[]) {
 		}
 		printf("workerthreads: %i\n", workerthreads_num);
 	}
+	getServerInfo(argv[3]);
 	{
 		int socks[2];
 		int err = socketpair(AF_UNIX, SOCK_STREAM, 0, socks);
@@ -410,16 +592,39 @@ int main(int argc, char *argv[]) {
 	{
 		//now to start the worker threads.
 		pthread_t latestworkerthread;
+		pthread_attr_t worker_attributes;
+		{
+			int err = pthread_attr_init(&worker_attributes);
+			if (unlikely(err != 0)) {
+				myerror(EXIT_FAILURE, err,
+						"failed pthread_attr_init(&worker_attributes); ");
+			}
+			//2 meg should be plenty. a safeguard against small default stack sizes, and a memory saving feature of big stack sizes..
+			// (default on my system is 8 meg)
+			err = pthread_attr_setstacksize(&worker_attributes,
+					2 * 1024 * 1024);
+			if (unlikely(err != 0)) {
+				myerror(EXIT_FAILURE, err, "failed to set worker stack size! ");
+			}
+		}
+
 		printf("starting worker threads... ");
 		fflush(stdout);
 		for (int i = 0; i < workerthreads_num; ++i) {
-			int err = pthread_create(&latestworkerthread, NULL,
+			int err = pthread_create(&latestworkerthread, &worker_attributes,
 					process_requests,
 					NULL);
 			if (unlikely(err != 0)) {
 				myerror(EXIT_FAILURE, err,
 						"failed to create worker threads! # of threads created before failure: %i",
 						i);
+			}
+		}
+		{
+			int err = pthread_attr_destroy(&worker_attributes);
+			if (unlikely(err != 0)) {
+				myerror(EXIT_FAILURE, err,
+						"failed pthread_attr_destroy(&worker_attributes); ");
 			}
 		}
 		printf("done.\n");
