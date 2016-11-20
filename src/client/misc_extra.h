@@ -5,6 +5,9 @@ char *get_process_name_by_pid(const int pid, char** failreason);
 uint64_t htonll(uint64_t hostlong);
 uint64_t ntohll(uint64_t hostlong);
 
+uint64_t htolell(uint64_t hostlong);
+uint64_t htobell(uint64_t hostlong);
+
 #if !defined(NTOHL)
 #if !defined(__BYTE_ORDER)
 #error Failed to detect byte order! fix the code yourself and/or submit a bugreport!

@@ -9,6 +9,8 @@
 #include <curl/curl.h>
 #define CLIENT_ECURL_H_
 CURL *ecurl_easy_init();
+CURLcode ecurl_easy_perform(CURL *easy_handle);
+char *ecurl_easy_escape(CURL * curl, const char * string, const int length);
 
 
 //this 1 almost has to be a macro because of how curl_easy_setopt is made (a macro taking different kinds of parameter types)

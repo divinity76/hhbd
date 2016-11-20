@@ -21,4 +21,13 @@ CURLcode ecurl_easy_perform(CURL *easy_handle) {
 	return ret;
 }
 
+char *ecurl_easy_escape(CURL * curl, const char * string, const int length) {
+	char *ret = curl_easy_escape(curl, string, length);
+	if (unlikely(ret==NULL)) {
+		myerror(EXIT_FAILURE, errno,
+				"curl_easy_escape failed! input string: %s\n", string);
+	}
+	return ret;
+}
+
 

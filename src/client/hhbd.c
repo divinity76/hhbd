@@ -30,31 +30,37 @@
 #include <signal.h>
 #include <string.h>
 #include <pwd.h>
+#include <assert.h>
 #include <curl/curl.h>
+
+#include "misc.h"
+#include "misc_extra.h"
+#include "hhbd.h"
+#include "ecurl.h"
 // todo: this code probably don't work
 // right on platforms that does not support unaligned memory access
 // ( https://www.kernel.org/doc/Documentation/unaligned-memory-access.txt )
 // fix that sometime... (this is all theoretical. i don't have such a platform to test on...)
 //#include <asm/unaligned.h>
 
-#include "misc.h"
-#include "misc_extra.h"
-#include "hhbd.h"
-#include "ecurl.h"
+_Static_assert(sizeof(intptr_t)<=sizeof(void*),"due to SO_LINGER thread optimizations, "
+		"this code currently requires that sizeof(intptr_t) <=sizeof(void*), which "
+		"is generally true, but not guaranteed by C specs... (easy to fix but would result in slower code)");
 
 struct {
 	int nbd_fd;
 	int localrequestsocket;
 	int remoterequestsocket;
-} kernelIPC = { .nbd_fd = -1, .localrequestsocket = -1, .remoterequestsocket =
+}volatile kernelIPC = { .nbd_fd = -1, .localrequestsocket = -1,
+		.remoterequestsocket =
 		-1 };
 
-bool is_shutting_down = false;
+volatile bool is_shutting_down = false;
 pthread_mutex_t alter_num_workerthreads_mutex;
-static size_t num_workerthreads = 0;
+volatile size_t num_workerthreads = 0;
 enum blocksizeEnum {
 	//4096 is the max block size linux support at the moment, unfortunately
-	blocksize = (uint64_t) 4096
+	blocksize = 4096
 };
 // 255 was chosen at random(ish)...
 struct {
@@ -63,9 +69,11 @@ struct {
 	char infourl[255];
 	char requestWriteSocketUrl[255];
 	char readurl[255];
-} serverinfo = { 0 };
+	char myIP[255];
+	uint16_t myport;
+}volatile serverinfo = { 0 };
 void getServerInfo(const char* infourl) {
-	static bool isRequestingInfo = false;
+	static volatile bool isRequestingInfo = false;
 	if (unlikely(isRequestingInfo || serverinfo.hasinfo)) {
 		myerror(EXIT_FAILURE, errno,
 				"changing server at runtime is not supported at this time."
@@ -80,11 +88,23 @@ void getServerInfo(const char* infourl) {
 					sizeof(serverinfo.infourl) - 1, len);
 		}
 	}
-	strcpy(serverinfo.infourl, infourl);
-
+	//compiler: expected ‘char * restrict’ but argument is of type ‘volatile char *’
+	//not sure what to make of that..
+	strcpy((char*) serverinfo.infourl, infourl);
 	CURLcode ret;
 	CURL *curlh = ecurl_easy_init();
-	ecurl_easy_setopt(curlh, CURLOPT_URL, serverinfo.infourl);
+	//i wonder, is THIS what really should be in serverinfo.infourl ?
+	//TODO: curl_easy_escape(serverinfo.myIP)
+	char *myIP_escaped = ecurl_easy_escape(curlh, (const char*) serverinfo.myIP,
+			(int) strlen((const char*) serverinfo.myIP));
+	char *infoRequestUrl = emalloc(
+			(size_t) snprintf(NULL, 0, "%s?ip=%s&port=%" PRIu16,
+					serverinfo.infourl,
+					serverinfo.myIP,
+					serverinfo.myport) + 1);
+	sprintf(infoRequestUrl, "%s?ip=%s&port=%" PRIu16, serverinfo.infourl,
+			serverinfo.myIP, serverinfo.myport);
+	ecurl_easy_setopt(curlh, CURLOPT_URL, infoRequestUrl);
 	ecurl_easy_setopt(curlh, CURLOPT_NOPROGRESS, 1L);
 	//ecurl_easy_setopt(curlh, CURLOPT_HEADER, 0L);
 	ecurl_easy_setopt(curlh, CURLOPT_USERAGENT, "curl/7.50.1");
@@ -104,26 +124,52 @@ void getServerInfo(const char* infourl) {
 	FILE *result = etmpfile();
 	ecurl_easy_setopt(curlh, CURLOPT_WRITEDATA, result);
 	ret = curl_easy_perform(curlh);
+	if (unlikely(ret != CURLE_OK)) {
+		myerror(EXIT_FAILURE, errno,
+				"curl failed to fetch %s ! return value: %i. strerror: %s\n",
+				infoRequestUrl, ret, curl_easy_strerror(ret));
+	}
 	{
 		rewind(result);
-		printf("GOT INFO!\n");
 		int ret = fscanf(result,
 						"hhbd OK\nreadurl:%254s\nrequestWriteSocketUrl:%254s\ntotalSize:%zu\n",
 						serverinfo.readurl, serverinfo.requestWriteSocketUrl,
 						&serverinfo.totalsize
 		);
 		printf(
-				"readurl: %s\nrequestWriteSocketUrl: %s\ntotalsize: %zu parsed correctly (should be 3): %i\n",
-				serverinfo.readurl, serverinfo.requestWriteSocketUrl,
+				"readurl: %s\nrequestWriteSocketUrl: %s\ntotalsize: %zu\n parsed correctly (should be 3): %i\n",
+				infoRequestUrl, serverinfo.requestWriteSocketUrl,
 				serverinfo.totalsize, ret);
 		if (unlikely(ret != 3)) {
-			printf("WARNING: COULD NOT READ ALL 3!\n");
+			fseek(result, 0, SEEK_END);
+			size_t size;
+			{
+				off_t off = ftello(result);
+				if (unlikely(off == -1)) {
+					//sigh
+					myerror(0, errno,
+							"unable to get size of data downloaded by curl!\n");
+					size = 0;
+				} else {
+					size = (size_t) off;
+				}
+			}
+			char* buf = emalloc(size + 1);
+			buf[size] = '0';
+			rewind(result);
+			fread(buf, size, 1, result);
+			myerror(EXIT_FAILURE, errno,
+					"invalid response from readurl (%s)! fscanf could only parse %i of 3 required parameters. response: %s",
+					infoRequestUrl, ret, buf);
+			UNREACHABLE();
+			free(buf);
 		}
 		fflush(stdout);
 	}
 	{
 		curl_easy_cleanup(curlh);
 		fclose(result);
+		free(infoRequestUrl);
 	}
 	serverinfo.hasinfo = true;
 }
@@ -263,9 +309,9 @@ void* nbd_doit_thread(void *arg) {
 		myerror(EXIT_FAILURE, errno,
 				"failed to ioctl(kernelIPC.nbd_fd, NBD_SET_SOCK, kernelIPC.global_remoterequestsocket) !\n");
 	}
-//	_Static_assert(totalsize % blocksize == 0,
-//			"the kernel is dividing totalsize by blocksize to get number of sectors. "
-//					"if totalsize is not a multiple of blocksize, you are probably doing something wrong!!!");
+	assert(
+			serverinfo.totalsize % blocksize == 0
+					&& "the kernel is dividing totalsize by blocksize to get number of sectors. totalsize is not a multiple of blocksize, you are probably doing something wrong!!!");
 	if (unlikely(0 != ioctl(kernelIPC.nbd_fd, NBD_SET_BLKSIZE, blocksize))) { //should check if higher is possible too...
 		myerror(EXIT_FAILURE, errno,
 				"failed to ioctl(kernelIPC.nbd_fd, NBD_SET_BLKSIZE, %i) !\n",
@@ -382,8 +428,8 @@ ssize_t ewrite(const int fd, const void *buf, const size_t count) {
 pthread_mutex_t process_request_mutex;
 void *process_requests(void *unused) {
 	(void) unused;
-	//global variables often cannot be held in cpu registers, and thus are more difficult to optimize.
-	//so, make a local copy of it.
+	//volatile global variables often cannot be held in cpu registers (for long), and thus are more difficult to optimize.
+	//so, make a local copy of it, since it wont change at this point anyway.
 	const int localrequestsocket = kernelIPC.localrequestsocket;
 	//optimization note: add POSIX_MADV_SEQUENTIAL to request.buffer and reply?
 	struct myrequest request = { 0 };
@@ -427,7 +473,7 @@ void *process_requests(void *unused) {
 		}
 		if (unlikely(bytes_read != sizeof(request.nbdrequest))) {
 			myerror(0, errno,
-					"got invalid request! all requests must be at minimum %zu bytes, but got a request with only %zu bytes! reply bytes follow: ",
+					"got invalid request! all requests must be at minimum %zu bytes, but got a request with only %zu bytes! reply bytes follow:",
 					sizeof(request.nbdrequest), bytes_read);
 			if (bytes_read <= 0) {
 				fprintf(stderr,
@@ -609,11 +655,18 @@ void init_mutexes(void) {
 				"failed to initialize mutex alter_num_workerthreads_mutex!\n");
 	}
 }
+#define ARGV_NBD argv[1]
+#define ARGV_THREADS argv[2]
+#define ARGV_SERVERINFO argv[3]
+#define ARGV_MYIP argv[4]
+#define ARGV_MYPORT argv[5]
 int main(int argc, char *argv[]) {
 	{
 		CURLcode err = curl_global_init(CURL_GLOBAL_DEFAULT);
-		if (unlikely(err != 0)) {
-			myerror(EXIT_FAILURE, err, "curl_global_init failed!");
+		if (unlikely(err != CURLE_OK)) {
+			myerror(EXIT_FAILURE, errno,
+					"curl_global_init failed! error number: %i. strerror: %s",
+					err, curl_easy_strerror(err));
 		}
 	}
 	init_mutexes();
@@ -621,22 +674,22 @@ int main(int argc, char *argv[]) {
 	installShutdownSignalHandlers();
 	if (argc - 1 != 5) {
 		myerror(EXIT_FAILURE, EINVAL,
-				"wrong number of input arguments.\n need 5, got %i\n usage: %s /dev/nbdX number_of_threads http://example.org/foo/serverinfo.php MyGlobalHostNameOrIP.com portnum\n",
+				"wrong number of input arguments.\n need 5, got %i\n usage: %s /dev/nbdX number_of_threads http://example.org/foo/serverinfo.php MyGlobalHostNameOrIP portnum\n",
 				argc - 1, argv[0]);
 	}
-	myerror(1, 0, "hi");
-	kernelIPC.nbd_fd = open(argv[1], O_RDWR);
+	kernelIPC.nbd_fd = open(ARGV_NBD, O_RDWR);
 	if (unlikely(kernelIPC.nbd_fd == -1)) {
 		myerror(EXIT_FAILURE, errno,
-				"failed to open %s in O_RDWR!! (maybe nbd module is not loaded? \"modprobe nbd\")\n",
-				argv[1]);
+				"failed to open argument 1 (/dev/nbdX) in O_RDWR!: %s (maybe nbd module is not loaded? \"modprobe nbd\")\n",
+				ARGV_NBD);
 	}
 	int workerthreads_num;
 	{
-		int scanres = sscanf(argv[2], "%i", &workerthreads_num);
+		int scanres = sscanf(ARGV_THREADS, "%i", &workerthreads_num);
 		if (unlikely(scanres == EOF || scanres < 1)) {
 			myerror(EXIT_FAILURE, EINVAL,
-					"failed to parse argument as an integer!: %s\n", argv[2]);
+					"failed to parse argument 2 (number_of_threads) as an integer!: %s\n",
+			ARGV_THREADS);
 		}
 		if (unlikely(workerthreads_num < 1)) {
 			myerror(EXIT_FAILURE, EINVAL,
@@ -645,8 +698,28 @@ int main(int argc, char *argv[]) {
 		}
 		printf("workerthreads: %i\n", workerthreads_num);
 	}
-	getServerInfo(argv[3]);
-	myerror(EXIT_FAILURE, errno, "info...");
+	{
+		if (unlikely(strlen(ARGV_MYIP)>(int)sizeof(serverinfo.myIP)-1)) {
+			myerror(EXIT_FAILURE, EINVAL,
+					"the length of ip/hostname MUST be <= %li but is %li",
+					sizeof(serverinfo.myIP) - 1, strlen(ARGV_MYIP));
+		}
+		strcpy((char*) serverinfo.myIP, ARGV_MYIP);
+	}
+	{
+		if (unlikely(1!=sscanf(ARGV_MYPORT,"%" SCNu16, &serverinfo.myport))) {
+			myerror(EXIT_FAILURE, EINVAL,
+					"failed to parse argument 5 (myport) as an unsigned 16 bit integer!: %s\n",
+					ARGV_MYPORT);
+		}
+		if (unlikely(serverinfo.myport == 0)) {
+			myerror(EXIT_FAILURE, EINVAL,
+					"argument 5 (myport) CAN NOT BE 0. if i request port 0, the kernel will "
+							"do funny stuff and give me a random port! not programmed for that.\n");
+		}
+
+	}
+	getServerInfo(ARGV_SERVERINFO);
 	{
 		int socks[2];
 		int err = socketpair(AF_UNIX, SOCK_STREAM, 0, socks);
@@ -658,9 +731,24 @@ int main(int argc, char *argv[]) {
 		kernelIPC.remoterequestsocket = socks[1];
 	}
 	{
-		//optimizeme? doitthread requires a very small stack size, could probably save a few megabytes of ram here.
 		pthread_t doitthread;
 		pthread_mutex_t unlock_before_doingit_mutex;
+		pthread_attr_t doitthread_attributes;
+		{
+			int err = pthread_attr_init(&doitthread_attributes);
+			if (unlikely(err != 0)) {
+				myerror(EXIT_FAILURE, err,
+						"failed pthread_attr_init(&doitthread_attributes); ");
+			}
+			//1 meg should be plenty. a safeguard against small default stack sizes, and a memory saving feature of big stack sizes..
+			// (default on my system is 8 meg)
+			err = pthread_attr_setstacksize(&doitthread_attributes,
+					1 * 1024 * 1024);
+			if (unlikely(err != 0)) {
+				myerror(EXIT_FAILURE, err,
+						"failed to set doitthread stack size! ");
+			}
+		}
 		int err;
 		err = pthread_mutex_init(&unlock_before_doingit_mutex, NULL);
 		if (unlikely(err != 0)) {
@@ -684,6 +772,13 @@ int main(int argc, char *argv[]) {
 			myerror(EXIT_FAILURE, err,
 					"failed to wait for doitthread to unlock unlock_before_doingit_mutex!\n");
 		}
+		{
+			int err = pthread_attr_destroy(&doitthread_attributes);
+			if (unlikely(err != 0)) {
+				myerror(EXIT_FAILURE, err,
+						"failed pthread_attr_destroy(&doitthread_attributes); ");
+			}
+		}
 	}
 	{
 		//now to start the worker threads.
@@ -695,10 +790,10 @@ int main(int argc, char *argv[]) {
 				myerror(EXIT_FAILURE, err,
 						"failed pthread_attr_init(&worker_attributes); ");
 			}
-			//2 meg should be plenty. a safeguard against small default stack sizes, and a memory saving feature of big stack sizes..
+			//1 meg should be plenty. a safeguard against small default stack sizes, and a memory saving feature of big stack sizes..
 			// (default on my system is 8 meg)
 			err = pthread_attr_setstacksize(&worker_attributes,
-					2 * 1024 * 1024);
+					1 * 1024 * 1024);
 			if (unlikely(err != 0)) {
 				myerror(EXIT_FAILURE, err, "failed to set worker stack size! ");
 			}

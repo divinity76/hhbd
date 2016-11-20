@@ -12,6 +12,30 @@
 
 
 
+uint64_t htolell(uint64_t hostlong) {
+#if !defined(__BYTE_ORDER__) || !defined(__ORDER_BIG_ENDIAN__)
+#error unable to detect byte order! you will need to manually fix the code (and/or submit a bugreport?)
+#endif
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	return bswap_64(hostlong);
+#else
+	return hostlong;
+#endif
+
+}
+uint64_t htobell(uint64_t hostlong) {
+#if !defined(__BYTE_ORDER__) || !defined(__ORDER_BIG_ENDIAN__)
+#error unable to detect byte order! you will need to manually fix the code (and/or submit a bugreport?)
+#endif
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	return hostlong;
+#else
+	return bswap_64(hostlong);
+#endif
+
+}
+
+
 
 uint64_t htonll(uint64_t hostlong) {
 #if !defined(__BYTE_ORDER__) || !defined(__ORDER_BIG_ENDIAN__)
@@ -44,8 +68,10 @@ sprintf(target,__VA_ARGS__); \
 }
 
 //free me. always.
-char *get_process_name_by_pid(const int pid, char** unused) {
+char *get_process_name_by_pid(const int pid, char **unused) {
+	if (unused) {
 	*unused = ecalloc(1, 1);
+	}
 	char* name = ecalloc(1024, sizeof(char));
 	if (name) {
 		sprintf(name, "/proc/%d/cmdline", pid);
