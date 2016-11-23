@@ -21,4 +21,12 @@ if(unlikely( ret  != CURLE_OK)){ \
 	} \
 }
 
+#define ecurl_easy_getinfo(curl,info,...){ \
+	CURLcode ret=curl_easy_getinfo(curl,info,__VA_ARGS__); \
+	if(unlikely(ret!=CURLE_OK)){ \
+		 myerror(EXIT_FAILURE,errno,"curl_easy_getinfo failed to get info %i. CURLCode: %i curl_easy_strerror: %s\n", info, ret, curl_easy_strerror(ret));   \
+	} \
+}
+
+
 #endif /* CLIENT_ECURL_H_ */

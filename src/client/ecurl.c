@@ -30,4 +30,3 @@ char *ecurl_easy_escape(CURL * curl, const char * string, const int length) {
 	return ret;
 }
 
-

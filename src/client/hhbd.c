@@ -8,6 +8,8 @@
  ============================================================================
  */
 
+// _GNU_SOURCE for sendmmsg
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -31,6 +33,7 @@
 #include <string.h>
 #include <pwd.h>
 #include <assert.h>
+#include <time.h>
 #include <curl/curl.h>
 
 #include "misc.h"
@@ -52,8 +55,14 @@ struct {
 	int localrequestsocket;
 	int remoterequestsocket;
 }volatile kernelIPC = { .nbd_fd = -1, .localrequestsocket = -1,
-		.remoterequestsocket =
-		-1 };
+		.remoterequestsocket = -1 };
+//maybe make this runtime defined sometime.
+#define CompileTimeDefinedNumberOfWriteSockets 10
+#define CompileTimeDefinedMaxNumberOfBlocksPerKernelRequest 1000
+struct {
+	time_t closes_after_ts;
+	int sock;
+}volatile writeSockets[CompileTimeDefinedNumberOfWriteSockets] = { 0 };
 
 volatile bool is_shutting_down = false;
 pthread_mutex_t alter_num_workerthreads_mutex;
@@ -99,11 +108,10 @@ void getServerInfo(const char* infourl) {
 			(int) strlen((const char*) serverinfo.myIP));
 	char *infoRequestUrl = emalloc(
 			(size_t) snprintf(NULL, 0, "%s?ip=%s&port=%" PRIu16,
-					serverinfo.infourl,
-					serverinfo.myIP,
-					serverinfo.myport) + 1);
+					serverinfo.infourl, myIP_escaped, serverinfo.myport) + 1);
 	sprintf(infoRequestUrl, "%s?ip=%s&port=%" PRIu16, serverinfo.infourl,
-			serverinfo.myIP, serverinfo.myport);
+			myIP_escaped, serverinfo.myport);
+	curl_free(myIP_escaped);
 	ecurl_easy_setopt(curlh, CURLOPT_URL, infoRequestUrl);
 	ecurl_easy_setopt(curlh, CURLOPT_NOPROGRESS, 1L);
 	//ecurl_easy_setopt(curlh, CURLOPT_HEADER, 0L);
@@ -131,14 +139,14 @@ void getServerInfo(const char* infourl) {
 	}
 	{
 		rewind(result);
-		int ret = fscanf(result,
+		int ret =
+				fscanf(result,
 						"hhbd OK\nreadurl:%254s\nrequestWriteSocketUrl:%254s\ntotalSize:%zu\n",
 						serverinfo.readurl, serverinfo.requestWriteSocketUrl,
-						&serverinfo.totalsize
-		);
+						&serverinfo.totalsize);
 		printf(
 				"readurl: %s\nrequestWriteSocketUrl: %s\ntotalsize: %zu\n parsed correctly (should be 3): %i\n",
-				infoRequestUrl, serverinfo.requestWriteSocketUrl,
+				serverinfo.readurl, serverinfo.requestWriteSocketUrl,
 				serverinfo.totalsize, ret);
 		if (unlikely(ret != 3)) {
 			fseek(result, 0, SEEK_END);
@@ -155,7 +163,7 @@ void getServerInfo(const char* infourl) {
 				}
 			}
 			char* buf = emalloc(size + 1);
-			buf[size] = '0';
+			buf[size] = '\0';
 			rewind(result);
 			fread(buf, size, 1, result);
 			myerror(EXIT_FAILURE, errno,
@@ -221,13 +229,13 @@ void exit_global_cleanup(void) {
 	if (kernelIPC.remoterequestsocket != -1) {
 		if (-1 == close(kernelIPC.remoterequestsocket)) {
 			myerror(0, errno,
-					"Warning: failed to close the kernelIPC.global_remoterequestsocket!\n");
+					"Warning: failed to close the kernelIPC.remoterequestsocket!\n");
 		}
 	}
 	if (kernelIPC.localrequestsocket != -1) {
 		if (-1 == close(kernelIPC.localrequestsocket)) {
 			myerror(0, errno,
-					"Warning: failed to close the kernelIPC.global_localrequestsocket!\n");
+					"Warning: failed to close the kernelIPC.localrequestsocket!\n");
 		}
 	}
 	curl_global_cleanup();
@@ -396,9 +404,15 @@ void installShutdownSignalHandlers(void) {
 }
 //this 1 must be packed. (because i'm sending it all in a single send() for thread sync issues)
 struct myreply {
-	struct nbd_reply nbdreply;
-	char buffer[blocksize];
+	struct nbd_reply nbdreply __attribute((packed));
+	char buffer[blocksize * CompileTimeDefinedMaxNumberOfBlocksPerKernelRequest];
 }__attribute((packed));
+
+struct myreply_withpos {
+	struct myreply myreply;
+	size_t write_pos;
+};
+
 //this 1 also needs to be packed because i'll be sending everything from myrequest.nbdrequest.from
 // to the location of the end of myrequest.nbdrequest.len + myrequest.nbdrequest.len bytes
 // in a single send.
@@ -409,12 +423,66 @@ struct myrequest {
 void print_request_data(struct myrequest *request) {
 	printf("request->magic: %i\n", ntohl(request->nbdrequest.magic));
 	printf("request->type: %i\n", ntohl(request->nbdrequest.type));
+	{
+		uint64_t nhandle;
+		_Static_assert(sizeof(nhandle) == sizeof(request->nbdrequest.handle),
+				"if this fails, the the code around needs to get updated.");
+		memcpy(&nhandle, request->nbdrequest.handle, sizeof(nhandle));
 	printf("request->handle: %zu\n",
-			ntohll(*(uint64_t*) request->nbdrequest.handle));
+			ntohll(nhandle));
+	}
 	printf("request->from: %zu\n", ntohll(request->nbdrequest.from));
 	printf("request->len: %ul\n", ntohl(request->nbdrequest.len));
 }
 
+void ewrite3(const int sockfd, const struct iovec iov) {
+	struct mmsghdr header;
+	header.msg_len = 1;
+
+	//header.msg_name=NULL;
+	header.msg_hdr.msg_namelen = 0;
+	header.msg_hdr.msg_iov = (struct iovec*) &iov;
+	header.msg_hdr.msg_iovlen = 1;
+	//header.msg_control=NULL;
+	header.msg_hdr.msg_controllen = 0;
+	// some time in the future, it wouldn't surprise me if
+	// msg_flags were no longer ignored.
+	// after which, msg_flags would need to be initialized...
+	// but ever since sendmsg was introduced, and to kernel 4.8, this is not the case..
+	// and afaik, it wont be the case any time in the near future...
+	// thus, as it currently stands, initializing it is a waste of cpu...
+	header.msg_hdr.msg_flags = 0;
+	const int sent1 = sendmmsg(sockfd, &header, 1, 0);
+	if (unlikely(sent1 != 1)) {
+		myerror(EXIT_FAILURE, errno,
+				"failed to sendmsg() all data! tried to write %zu bytes. sendmmsg() was supposed to return 1, but returned %i\n",
+				iov.iov_len, sent1);
+	}
+}
+
+ssize_t ewrite2(const int fd, const struct iovec iov) {
+	struct msghdr header;
+	//header.msg_name=NULL;
+	header.msg_namelen = 0;
+	header.msg_iov = (struct iovec*) &iov;
+	header.msg_iovlen = 1;
+	//header.msg_control=NULL;
+	header.msg_controllen = 0;
+	// some time in the future, it wouldn't surprise me if
+	// msg_flags were no longer ignored.
+	// after which, msg_flags would need to be initialized...
+	// but ever since sendmsg was introduced, and to kernel 4.8, this is not the case..
+	// and afaik, it wont be the case any time in the near future...
+	// thus, as it currently stands, initializing it is a waste of cpu...
+	header.msg_flags = 0;
+	const ssize_t ret = sendmsg(fd, &header, 0);
+	if (unlikely(ret != iov.iov_len)) {
+		myerror(EXIT_FAILURE, errno,
+				"failed to sendmsg() all data! tried to write %zu bytes, but could only write %zd bytes!",
+				iov.iov_len, ret);
+	}
+	return ret;
+}
 ssize_t ewrite(const int fd, const void *buf, const size_t count) {
 	const ssize_t ret = write(fd, buf, count);
 	if (unlikely(ret != (ssize_t )count)) {
@@ -426,6 +494,31 @@ ssize_t ewrite(const int fd, const void *buf, const size_t count) {
 }
 
 pthread_mutex_t process_request_mutex;
+size_t curl_myreply_writer_callback(const char *ptr, const size_t size,
+		const size_t nmemb, struct myreply_withpos *userdata) {
+	size_t datatowrite = size * nmemb;
+	//Todo: should check actual requested size, not blocksize, really...
+	if (unlikely(
+			userdata->write_pos + datatowrite
+					> sizeof(userdata->myreply.buffer))) {
+		//...
+		myerror(0, 0,
+				"curl got more data than the size of reply buffer! should never happen, something is wrong.. will retry request."
+						" number of bytes recieved: %zu. blocksize: %zu.\n",
+				(size_t )(userdata->write_pos + datatowrite),
+				(size_t )blocksize);
+		fprintf(stderr, "recieved data:");
+		fwrite(&userdata->myreply.buffer[0], userdata->write_pos, 1, stderr);
+		fwrite(ptr, datatowrite, 1, stderr);
+		fflush(stderr);
+		// 0 here means 0 bytes written, not success.
+		return 0;
+	}
+	memcpy(&userdata->myreply.buffer[userdata->write_pos], ptr, datatowrite);
+	userdata->write_pos += datatowrite;
+	return datatowrite;
+}
+
 void *process_requests(void *unused) {
 	(void) unused;
 	//volatile global variables often cannot be held in cpu registers (for long), and thus are more difficult to optimize.
@@ -433,10 +526,30 @@ void *process_requests(void *unused) {
 	const int localrequestsocket = kernelIPC.localrequestsocket;
 	//optimization note: add POSIX_MADV_SEQUENTIAL to request.buffer and reply?
 	struct myrequest request = { 0 };
-	struct myreply reply = { 0 };
-	reply.nbdreply.magic = HTONL(NBD_REPLY_MAGIC);
-	reply.nbdreply.error = HTONL(0);
-
+	struct myreply_withpos reply = { 0 };
+	reply.myreply.nbdreply.magic = HTONL(NBD_REPLY_MAGIC);
+	reply.myreply.nbdreply.error = HTONL(0);
+	CURL *curlh = ecurl_easy_init();
+	ecurl_easy_setopt(curlh, CURLOPT_URL, (const char* )serverinfo.readurl);
+	ecurl_easy_setopt(curlh, CURLOPT_NOPROGRESS, 1L);
+	//ecurl_easy_setopt(curlh, CURLOPT_HEADER, 0L);
+	ecurl_easy_setopt(curlh, CURLOPT_USERAGENT, "curl/7.50.1");
+	ecurl_easy_setopt(curlh, CURLOPT_MAXREDIRS, 50L);
+	//optimize note: tls might make a huge overhead for the workers...
+	ecurl_easy_setopt(curlh, CURLOPT_HTTP_VERSION,
+			(long )CURL_HTTP_VERSION_2TLS);
+	//ecurl_easy_setopt(curlh, CURLOPT_SSH_KNOWNHOSTS, "/root/.ssh/known_hosts");
+	{
+		//unsafe options
+		ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYHOST, 0L);
+		ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYPEER, 0L);
+		ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYSTATUS, 0L);
+	}
+	ecurl_easy_setopt(curlh, CURLOPT_WRITEDATA, &reply);
+	ecurl_easy_setopt(curlh, CURLOPT_WRITEFUNCTION,
+			curl_myreply_writer_callback);
+	// not sure if i should ecurl_easy_setopt(curlh, CURLOPT_BUFFERSIZE, blocksize);
+	//should i set CURLOPT_MAXFILESIZE ?
 	++num_workerthreads;
 	while (1) {
 		{
@@ -460,10 +573,12 @@ void *process_requests(void *unused) {
 		ssize_t bytes_read = recv(localrequestsocket, &request.nbdrequest,
 				sizeof(request.nbdrequest), MSG_WAITALL);
 		if (unlikely(is_shutting_down)) {
-			reply.nbdreply.error = HTONL(ESHUTDOWN);
-			*(uint64_t*) reply.nbdreply.handle =
-					*(uint64_t*) request.nbdrequest.handle;
-			write(localrequestsocket, &reply.nbdreply, sizeof(reply.nbdreply));
+			reply.myreply.nbdreply.error = HTONL(ESHUTDOWN);
+			memcpy(reply.myreply.nbdreply.handle, request.nbdrequest.handle,
+					sizeof(request.nbdrequest.handle));
+
+			send(localrequestsocket, &reply.myreply.nbdreply,
+					sizeof(reply.myreply.nbdreply), 0);
 			int err = pthread_mutex_unlock(&process_request_mutex);
 			if (unlikely(err != 0)) {
 				myerror(EXIT_FAILURE, err,
@@ -505,12 +620,67 @@ void *process_requests(void *unused) {
 				}
 			}
 			request.nbdrequest.len = ntohl(request.nbdrequest.len);
-			if (unlikely(request.nbdrequest.len > blocksize)) {
-				myerror(EXIT_FAILURE, errno,
-						"got a (read) request bigger than blocksize! blocksize: %i. requestsize: %ul.\n",
-						blocksize, request.nbdrequest.len);
+			request.nbdrequest.from = ntohll(request.nbdrequest.from);
+			memcpy(reply.myreply.nbdreply.handle, request.nbdrequest.handle,
+					sizeof(request.nbdrequest.handle));
+			if (unlikely(
+					request.nbdrequest.len > sizeof(reply.myreply.buffer))) {
+				// kernel requested to read more than CompileTimeDefinedMaxNumberOfBlocksPerKernelRequest blocks at once.
+				// to tell the kernel that we don't support reading
+				// that many blocks at once, we just return EINVAL
+				// the kernel will re-issue lower and lower until
+				// read success or until blocksize, whichever comes first.
+				// (completely transparently to the user process)
+				fprintf(stderr, "foo!\n");
+				fprintf(stdout, "foo!\n");
+				reply.myreply.nbdreply.error = HTONL(EINVAL);
+				ewrite(localrequestsocket, &reply.myreply.nbdreply,
+						sizeof(reply.myreply.nbdreply));
+				break;
 			}
-			//TODO: read and respond
+			// likely because i'm not even sure the kernel
+			// EVER will request to read 0 bytes. but IF, against expectation, it ever does,
+			// the code inside would fail.
+			// (rangebuf would contain an invalid range for CURLOPT_RANGE. invalid range per the http specifications. etc)
+			if (likely(request.nbdrequest.len > 0)) {
+				//string(39) "9223372036854775807-9223372036854775807"
+				char rangebuf[40];
+				sprintf(rangebuf, "%" PRIu64 "-%" PRIu64,
+						(uint64_t) request.nbdrequest.from,
+						(uint64_t) ((request.nbdrequest.from
+								+ request.nbdrequest.len) - 1));
+				ecurl_easy_setopt(curlh, CURLOPT_RANGE, rangebuf);
+				while (1) {
+					reply.write_pos = 0;
+					CURLcode err = curl_easy_perform(curlh);
+					long httpresponse;
+					ecurl_easy_getinfo(curlh, CURLINFO_RESPONSE_CODE,
+							&httpresponse);
+					if (likely(err == CURLE_OK && httpresponse == 206)) {
+						break;
+					} else {
+						//something went wrong...
+						fprintf(stderr,
+								"ERROR: curl failed to fetch range %s. curl_easy_perform expected %ul, got %ul, strerror: %s. http response code expected 206, got %li. \n. will retry...",
+								rangebuf, CURLE_OK, err,
+								curl_easy_strerror(err), httpresponse);
+						fflush(stderr);
+					}
+				}
+			}
+			{
+				reply.myreply.nbdreply.error = HTONL(0);
+//				ewrite(localrequestsocket, &reply.myreply.nbdreply,
+//						sizeof(reply.myreply.nbdreply)
+//								+ request.nbdrequest.len);
+				{
+					const struct iovec iov = { .iov_base =
+							&reply.myreply.nbdreply, .iov_len =
+							sizeof(reply.myreply.nbdreply)
+									+ request.nbdrequest.len };
+					ewrite2(localrequestsocket, iov);
+				}
+			}
 			break;
 		}
 		case HTONL(NBD_CMD_WRITE): {
@@ -582,10 +752,11 @@ void *process_requests(void *unused) {
 							"Failed to unlock process_request_mutex!\n");
 				}
 			}
-			reply.nbdreply.error = HTONL(0);
-			*(uint64_t*) reply.nbdreply.handle =
-					*(uint64_t*) request.nbdrequest.handle;
-			ewrite(localrequestsocket, &reply.nbdreply, sizeof(reply.nbdreply));
+			reply.myreply.nbdreply.error = HTONL(0);
+			memcpy(reply.myreply.nbdreply.handle, request.nbdrequest.handle,
+					sizeof(request.nbdrequest.handle));
+			ewrite(localrequestsocket, &reply.myreply.nbdreply,
+					sizeof(reply.myreply.nbdreply));
 			break;
 		}
 		case HTONL(NBD_CMD_TRIM): {
@@ -602,10 +773,13 @@ void *process_requests(void *unused) {
 				}
 			}
 			//...
-			reply.nbdreply.error = HTONL(0);
-			*(uint64_t*) reply.nbdreply.handle =
-					*(uint64_t*) request.nbdrequest.handle;
-			ewrite(localrequestsocket, &reply.nbdreply, sizeof(reply.nbdreply));
+			reply.myreply.nbdreply.error = HTONL(0);
+			memcpy(reply.myreply.nbdreply.handle, request.nbdrequest.handle,
+					sizeof(request.nbdrequest.handle));
+//			*(uint64_t*) reply.myreply.nbdreply.handle =
+//					*(uint64_t*) request.nbdrequest.handle;
+			ewrite(localrequestsocket, &reply.myreply.nbdreply,
+					sizeof(reply.myreply.nbdreply));
 			break;
 		}
 		default: {
@@ -622,8 +796,9 @@ void *process_requests(void *unused) {
 		}
 		}
 	}
-	//is_shutting_down is true at this point
+	//is_shutting_down should be true at this point
 	--num_workerthreads;
+	curl_easy_cleanup(curlh);
 	return NULL;
 }
 void init_mutexes(void) {
@@ -688,13 +863,13 @@ int main(int argc, char *argv[]) {
 		int scanres = sscanf(ARGV_THREADS, "%i", &workerthreads_num);
 		if (unlikely(scanres == EOF || scanres < 1)) {
 			myerror(EXIT_FAILURE, EINVAL,
-					"failed to parse argument 2 (number_of_threads) as an integer!: %s\n",
+			"failed to parse argument 2 (number_of_threads) as an integer!: %s\n",
 			ARGV_THREADS);
 		}
 		if (unlikely(workerthreads_num < 1)) {
 			myerror(EXIT_FAILURE, EINVAL,
-					"number of worker threads MUST BE >=1  and <= max number of threads a single mutex lock can hold (and on my linux system, per glibc source, it is %ul (UINT_MAX), but i do not have the resources required to test it)\n",
-					UINT_MAX);
+			"number of worker threads MUST BE >=1  and <= max number of threads a single mutex lock can hold (and on my linux system, per glibc source, it is %ul (UINT_MAX), but i do not have the resources required to test it)\n",
+			UINT_MAX);
 		}
 		printf("workerthreads: %i\n", workerthreads_num);
 	}
@@ -741,6 +916,7 @@ int main(int argc, char *argv[]) {
 						"failed pthread_attr_init(&doitthread_attributes); ");
 			}
 			//1 meg should be plenty. a safeguard against small default stack sizes, and a memory saving feature of big stack sizes..
+			//to put things in perspective, if the size of a pointer is 8 bytes (64bit), we can now hold 131,072 pointers.
 			// (default on my system is 8 meg)
 			err = pthread_attr_setstacksize(&doitthread_attributes,
 					1 * 1024 * 1024);
@@ -791,9 +967,11 @@ int main(int argc, char *argv[]) {
 						"failed pthread_attr_init(&worker_attributes); ");
 			}
 			//1 meg should be plenty. a safeguard against small default stack sizes, and a memory saving feature of big stack sizes..
+			//to put things in perspective, if the size of a pointer is 8 bytes (64bit), we can now hold 131,072 pointers.
 			// (default on my system is 8 meg)
 			err = pthread_attr_setstacksize(&worker_attributes,
-					1 * 1024 * 1024);
+					(1 * 1024 * 1024)
+							+ sizeof(((struct myreply*) NULL)->buffer));
 			if (unlikely(err != 0)) {
 				myerror(EXIT_FAILURE, err, "failed to set worker stack size! ");
 			}
@@ -821,6 +999,11 @@ int main(int argc, char *argv[]) {
 		printf("done.\n");
 		fflush(stdout);
 	}
+
+	printf("CompileTimeDefinedNumberOfWriteSockets: %i\n",
+	CompileTimeDefinedNumberOfWriteSockets);
+	printf("CompileTimeDefinedMaxNumberOfBlocksPerKernelRequest: %i\n",
+	CompileTimeDefinedMaxNumberOfBlocksPerKernelRequest);
 
 	printf(
 			"main thread has finished. will sleep until a signal is received. (by issuing pause();...)\n");
