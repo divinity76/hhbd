@@ -9,7 +9,7 @@
  */
 
 // _GNU_SOURCE for sendmmsg
-#define _GNU_SOURCE
+//#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -402,24 +402,20 @@ void installShutdownSignalHandlers(void) {
 	//Now there are more non-standard signals who's default action is to terminate the process
 	// which we probably should look out for, but.... cba now. they shouldn't happen anyway (like some 99% of the list above)
 }
-//this 1 must be packed. (because i'm sending it all in a single send() for thread sync issues)
+struct mybuffer {
+	size_t buffer_size;
+	char* buffer;
+};
 struct myreply {
 	struct nbd_reply nbdreply __attribute((packed));
-	char buffer[blocksize * CompileTimeDefinedMaxNumberOfBlocksPerKernelRequest];
-}__attribute((packed));
-
-struct myreply_withpos {
-	struct myreply myreply;
+	struct mybuffer mybuf;
 	size_t write_pos;
 };
 
-//this 1 also needs to be packed because i'll be sending everything from myrequest.nbdrequest.from
-// to the location of the end of myrequest.nbdrequest.len + myrequest.nbdrequest.len bytes
-// in a single send.
 struct myrequest {
 	struct nbd_request nbdrequest;
-	char buffer[blocksize];
-}__attribute((packed));
+	struct mybuffer mybuf;
+};
 void print_request_data(struct myrequest *request) {
 	printf("request->magic: %i\n", ntohl(request->nbdrequest.magic));
 	printf("request->type: %i\n", ntohl(request->nbdrequest.type));
@@ -428,37 +424,36 @@ void print_request_data(struct myrequest *request) {
 		_Static_assert(sizeof(nhandle) == sizeof(request->nbdrequest.handle),
 				"if this fails, the the code around needs to get updated.");
 		memcpy(&nhandle, request->nbdrequest.handle, sizeof(nhandle));
-	printf("request->handle: %zu\n",
-			ntohll(nhandle));
+		printf("request->handle: %zu\n", ntohll(nhandle));
 	}
 	printf("request->from: %zu\n", ntohll(request->nbdrequest.from));
 	printf("request->len: %ul\n", ntohl(request->nbdrequest.len));
 }
 
-void ewrite3(const int sockfd, const struct iovec iov) {
-	struct mmsghdr header;
-	header.msg_len = 1;
-
-	//header.msg_name=NULL;
-	header.msg_hdr.msg_namelen = 0;
-	header.msg_hdr.msg_iov = (struct iovec*) &iov;
-	header.msg_hdr.msg_iovlen = 1;
-	//header.msg_control=NULL;
-	header.msg_hdr.msg_controllen = 0;
-	// some time in the future, it wouldn't surprise me if
-	// msg_flags were no longer ignored.
-	// after which, msg_flags would need to be initialized...
-	// but ever since sendmsg was introduced, and to kernel 4.8, this is not the case..
-	// and afaik, it wont be the case any time in the near future...
-	// thus, as it currently stands, initializing it is a waste of cpu...
-	header.msg_hdr.msg_flags = 0;
-	const int sent1 = sendmmsg(sockfd, &header, 1, 0);
-	if (unlikely(sent1 != 1)) {
-		myerror(EXIT_FAILURE, errno,
-				"failed to sendmsg() all data! tried to write %zu bytes. sendmmsg() was supposed to return 1, but returned %i\n",
-				iov.iov_len, sent1);
-	}
-}
+//void ewrite3(const int sockfd, const struct iovec iov) {
+//	struct mmsghdr header;
+//	header.msg_len = 1;
+//
+//	//header.msg_name=NULL;
+//	header.msg_hdr.msg_namelen = 0;
+//	header.msg_hdr.msg_iov = (struct iovec*) &iov;
+//	header.msg_hdr.msg_iovlen = 1;
+//	//header.msg_control=NULL;
+//	header.msg_hdr.msg_controllen = 0;
+//	// some time in the future, it wouldn't surprise me if
+//	// msg_flags were no longer ignored.
+//	// after which, msg_flags would need to be initialized...
+//	// but ever since sendmsg was introduced, and to kernel 4.8, this is not the case..
+//	// and afaik, it wont be the case any time in the near future...
+//	// thus, as it currently stands, initializing it is a waste of cpu...
+//	header.msg_hdr.msg_flags = 0;
+//	const int sent1 = sendmmsg(sockfd, &header, 1, 0);
+//	if (unlikely(sent1 != 1)) {
+//		myerror(EXIT_FAILURE, errno,
+//				"failed to sendmsg() all data! tried to write %zu bytes. sendmmsg() was supposed to return 1, but returned %i\n",
+//				iov.iov_len, sent1);
+//	}
+//}
 
 ssize_t ewrite2(const int fd, const struct iovec iov) {
 	struct msghdr header;
@@ -492,15 +487,55 @@ ssize_t ewrite(const int fd, const void *buf, const size_t count) {
 	}
 	return ret;
 }
+pthread_mutex_t replymutex;
+void nbdreply(const int fd, const void *buf1, const size_t buf1_size,
+		const void *buf2, const size_t buf2_size) {
+	{
+		int err;
+		err = pthread_mutex_lock(&replymutex);
+		if (unlikely(err != 0)) {
+			myerror(EXIT_FAILURE, err, "reply failed to lock replymutex!\n");
+		}
+	}
 
+	if (likely(buf1_size > 0)) {
+		size_t written_total = 0;
+		do {
+			ssize_t written = write(fd, &(((const char*) buf1)[written_total]),
+					buf1_size - written_total);
+			if (unlikely(written < 0)) {
+				myerror(EXIT_FAILURE, errno, "nbdreply write returned <0!!\n");
+			}
+			written_total += written;
+		} while (written_total < buf1_size);
+	}
+	if (likely(buf2_size > 0)) {
+		size_t written_total = 0;
+		do {
+			ssize_t written = write(fd, &(((const char*) buf2)[written_total]),
+					buf2_size - written_total);
+			if (unlikely(written < 0)) {
+				myerror(EXIT_FAILURE, errno, "nbdreply write returned <0!!\n");
+			}
+			written_total += written;
+		} while (written_total < buf2_size);
+	}
+	{
+		int err;
+		err = pthread_mutex_unlock(&replymutex);
+		if (unlikely(err != 0)) {
+			myerror(EXIT_FAILURE, err, "reply failed to unlock replymutex!\n");
+		}
+	}
+	return;
+}
 pthread_mutex_t process_request_mutex;
 size_t curl_myreply_writer_callback(const char *ptr, const size_t size,
-		const size_t nmemb, struct myreply_withpos *userdata) {
+		const size_t nmemb, struct myreply *userdata) {
 	size_t datatowrite = size * nmemb;
-	//Todo: should check actual requested size, not blocksize, really...
+	//Todo: should check actual requested size, not buffer size, really...
 	if (unlikely(
-			userdata->write_pos + datatowrite
-					> sizeof(userdata->myreply.buffer))) {
+			userdata->write_pos + datatowrite > userdata->mybuf.buffer_size)) {
 		//...
 		myerror(0, 0,
 				"curl got more data than the size of reply buffer! should never happen, something is wrong.. will retry request."
@@ -508,16 +543,31 @@ size_t curl_myreply_writer_callback(const char *ptr, const size_t size,
 				(size_t )(userdata->write_pos + datatowrite),
 				(size_t )blocksize);
 		fprintf(stderr, "recieved data:");
-		fwrite(&userdata->myreply.buffer[0], userdata->write_pos, 1, stderr);
+		fwrite(&userdata->mybuf.buffer[0], userdata->write_pos, 1, stderr);
 		fwrite(ptr, datatowrite, 1, stderr);
 		fflush(stderr);
 		// 0 here means 0 bytes written, not success.
 		return 0;
 	}
-	memcpy(&userdata->myreply.buffer[userdata->write_pos], ptr, datatowrite);
+	memcpy(&userdata->mybuf.buffer[userdata->write_pos], ptr, datatowrite);
 	userdata->write_pos += datatowrite;
 	return datatowrite;
 }
+//a resize is unlikely because it may happen a few times in the beginning,
+//but once it reaches the kernel max request/response size, it will never happen again..
+//lets hope the cpu prefetcher catches up on that eventually
+// #define putsize(x) _Generic((x), size_t: printf("%zu\n", x), default: assert(!"test requires size_t")) \n putsize (sizeof 0);
+#define REALBUF_MINSIZE(minsize){                             \
+			_Static_assert(sizeof(minsize) == sizeof(request.nbdrequest.len), \
+"should be a uint32_t..."); \
+if (unlikely(realbuffer.buffer_size < minsize)) { \
+	free(realbuffer.buffer); \
+	realbuffer.buffer = emalloc(minsize); \
+	realbuffer.buffer_size = minsize; \
+	request.mybuf = realbuffer; \
+	reply.mybuf = realbuffer; \
+} \
+};
 
 void *process_requests(void *unused) {
 	(void) unused;
@@ -526,9 +576,19 @@ void *process_requests(void *unused) {
 	const int localrequestsocket = kernelIPC.localrequestsocket;
 	//optimization note: add POSIX_MADV_SEQUENTIAL to request.buffer and reply?
 	struct myrequest request = { 0 };
-	struct myreply_withpos reply = { 0 };
-	reply.myreply.nbdreply.magic = HTONL(NBD_REPLY_MAGIC);
-	reply.myreply.nbdreply.error = HTONL(0);
+	struct myreply reply = { 0 };
+	struct mybuffer realbuffer = { 0 };	//<not a performance critical piece of code..
+	//32 is NOT random. its the highest i've ever seen from my own local amd64 system.
+	//the kernel first try blocksize*4. if i return EINVAL, it tries blocksize*1, but if success,
+	//it tries blocksize*8, then blocksize*16 , then blocksize*32
+	//and stops there and just issue *32 indefinitely.
+	//TODO: optimization note: make the socketpair buffer at least MAX(blocksize*32,currentbuffersize);
+	realbuffer.buffer = emalloc(blocksize * 32);
+	realbuffer.buffer_size = blocksize * 32;
+	request.mybuf = realbuffer;
+	reply.mybuf = realbuffer;
+	reply.nbdreply.magic = HTONL(NBD_REPLY_MAGIC);
+	reply.nbdreply.error = HTONL(0);
 	CURL *curlh = ecurl_easy_init();
 	ecurl_easy_setopt(curlh, CURLOPT_URL, (const char* )serverinfo.readurl);
 	ecurl_easy_setopt(curlh, CURLOPT_NOPROGRESS, 1L);
@@ -573,12 +633,11 @@ void *process_requests(void *unused) {
 		ssize_t bytes_read = recv(localrequestsocket, &request.nbdrequest,
 				sizeof(request.nbdrequest), MSG_WAITALL);
 		if (unlikely(is_shutting_down)) {
-			reply.myreply.nbdreply.error = HTONL(ESHUTDOWN);
-			memcpy(reply.myreply.nbdreply.handle, request.nbdrequest.handle,
+			reply.nbdreply.error = HTONL(ESHUTDOWN);
+			memcpy(reply.nbdreply.handle, request.nbdrequest.handle,
 					sizeof(request.nbdrequest.handle));
-
-			send(localrequestsocket, &reply.myreply.nbdreply,
-					sizeof(reply.myreply.nbdreply), 0);
+			send(localrequestsocket, &reply.nbdreply, sizeof(reply.nbdreply),
+					0);
 			int err = pthread_mutex_unlock(&process_request_mutex);
 			if (unlikely(err != 0)) {
 				myerror(EXIT_FAILURE, err,
@@ -621,28 +680,33 @@ void *process_requests(void *unused) {
 			}
 			request.nbdrequest.len = ntohl(request.nbdrequest.len);
 			request.nbdrequest.from = ntohll(request.nbdrequest.from);
-			memcpy(reply.myreply.nbdreply.handle, request.nbdrequest.handle,
+			_Static_assert(
+					sizeof(reply.nbdreply.handle)
+							== sizeof(request.nbdrequest.handle),
+					"if this fails, the code needs to get updated.");
+			memcpy(reply.nbdreply.handle, request.nbdrequest.handle,
 					sizeof(request.nbdrequest.handle));
-			if (unlikely(
-					request.nbdrequest.len > sizeof(reply.myreply.buffer))) {
-				// kernel requested to read more than CompileTimeDefinedMaxNumberOfBlocksPerKernelRequest blocks at once.
-				// to tell the kernel that we don't support reading
-				// that many blocks at once, we just return EINVAL
-				// the kernel will re-issue lower and lower until
-				// read success or until blocksize, whichever comes first.
-				// (completely transparently to the user process)
-				fprintf(stderr, "foo!\n");
-				fprintf(stdout, "foo!\n");
-				reply.myreply.nbdreply.error = HTONL(EINVAL);
-				ewrite(localrequestsocket, &reply.myreply.nbdreply,
-						sizeof(reply.myreply.nbdreply));
-				break;
-			}
+//			if (unlikely(
+//					request.nbdrequest.len > sizeof(reply.myreply.buffer))) {
+//				// kernel requested to read more than CompileTimeDefinedMaxNumberOfBlocksPerKernelRequest blocks at once.
+//				// to tell the kernel that we don't support reading
+//				// that many blocks at once, we just return EINVAL
+//				// the kernel will re-issue lower and lower until
+//				// read success or until blocksize, whichever comes first.
+//				// (completely transparently to the user process)
+//				fprintf(stderr, "foo!\n");
+//				fprintf(stdout, "foo!\n");
+//				reply.myreply.nbdreply.error = HTONL(EINVAL);
+//				ewrite(localrequestsocket, &reply.myreply.nbdreply,
+//						sizeof(reply.myreply.nbdreply));
+//				break;
+//			}
 			// likely because i'm not even sure the kernel
 			// EVER will request to read 0 bytes. but IF, against expectation, it ever does,
 			// the code inside would fail.
 			// (rangebuf would contain an invalid range for CURLOPT_RANGE. invalid range per the http specifications. etc)
 			if (likely(request.nbdrequest.len > 0)) {
+				REALBUF_MINSIZE(request.nbdrequest.len);
 				//string(39) "9223372036854775807-9223372036854775807"
 				char rangebuf[40];
 				sprintf(rangebuf, "%" PRIu64 "-%" PRIu64,
@@ -650,10 +714,11 @@ void *process_requests(void *unused) {
 						(uint64_t) ((request.nbdrequest.from
 								+ request.nbdrequest.len) - 1));
 				ecurl_easy_setopt(curlh, CURLOPT_RANGE, rangebuf);
-				while (1) {
+				long httpresponse;
+				CURLcode err;
+				do {
 					reply.write_pos = 0;
-					CURLcode err = curl_easy_perform(curlh);
-					long httpresponse;
+					err = curl_easy_perform(curlh);
 					ecurl_easy_getinfo(curlh, CURLINFO_RESPONSE_CODE,
 							&httpresponse);
 					if (likely(err == CURLE_OK && httpresponse == 206)) {
@@ -666,20 +731,13 @@ void *process_requests(void *unused) {
 								curl_easy_strerror(err), httpresponse);
 						fflush(stderr);
 					}
-				}
+				} while (unlikely(err != CURLE_OK || httpresponse != 206));
 			}
 			{
-				reply.myreply.nbdreply.error = HTONL(0);
-//				ewrite(localrequestsocket, &reply.myreply.nbdreply,
-//						sizeof(reply.myreply.nbdreply)
-//								+ request.nbdrequest.len);
-				{
-					const struct iovec iov = { .iov_base =
-							&reply.myreply.nbdreply, .iov_len =
-							sizeof(reply.myreply.nbdreply)
-									+ request.nbdrequest.len };
-					ewrite2(localrequestsocket, iov);
-				}
+				reply.nbdreply.error = HTONL(0);
+				nbdreply(localrequestsocket, &reply.nbdreply,
+						sizeof(reply.nbdreply), reply.mybuf.buffer,
+						request.nbdrequest.len);
 			}
 			break;
 		}
@@ -689,12 +747,14 @@ void *process_requests(void *unused) {
 			print_request_data(&request);
 #endif
 			request.nbdrequest.len = ntohl(request.nbdrequest.len);
-			if (unlikely(request.nbdrequest.len > blocksize)) {
-				myerror(EXIT_FAILURE, errno,
-						"got a (write) request bigger than blocksize! blocksize: %i. requestsize: %ul.\n",
-						blocksize, request.nbdrequest.len);
-			}
-			ssize_t bytes_read = recv(localrequestsocket, request.buffer,
+			REALBUF_MINSIZE(request.nbdrequest.len);
+
+//			if (unlikely(request.nbdrequest.len > blocksize)) {
+//				myerror(EXIT_FAILURE, errno,
+//						"got a (write) request bigger than blocksize! blocksize: %i. requestsize: %ul.\n",
+//						blocksize, request.nbdrequest.len);
+//			}
+			ssize_t bytes_read = recv(localrequestsocket, request.mybuf.buffer,
 					request.nbdrequest.len, MSG_WAITALL);
 			if (unlikely(bytes_read != request.nbdrequest.len)) {
 				myerror(0, errno,
@@ -704,13 +764,13 @@ void *process_requests(void *unused) {
 					fprintf(stderr,
 							"(not printed because the read size was <=0)\n");
 				} else {
-					fwrite(&request.buffer, (size_t) bytes_read, 1, stderr);
+					fwrite(&request.mybuf.buffer, (size_t) bytes_read, 1,
+					stderr);
 				}
 				fflush(stdout);
 				fflush(stderr);
 				exit(EXIT_FAILURE);
 			}
-			//TODO: write and respond. its in request.buffer
 			{
 				//let another thread read new requests
 				int err = pthread_mutex_unlock(&process_request_mutex);
@@ -719,7 +779,9 @@ void *process_requests(void *unused) {
 							"Failed to unlock process_request_mutex!\n");
 				}
 			}
-
+			{
+				//TODO: write and respond. its in request.buffer
+			}
 			break;
 		}
 		case HTONL(NBD_CMD_DISC): {
@@ -752,11 +814,17 @@ void *process_requests(void *unused) {
 							"Failed to unlock process_request_mutex!\n");
 				}
 			}
-			reply.myreply.nbdreply.error = HTONL(0);
-			memcpy(reply.myreply.nbdreply.handle, request.nbdrequest.handle,
+			reply.nbdreply.error = HTONL(0);
+			_Static_assert(
+					sizeof(reply.nbdreply.handle)
+							== sizeof(request.nbdrequest.handle),
+					"if this fails, the code needs to get updated.");
+			memcpy(reply.nbdreply.handle, request.nbdrequest.handle,
 					sizeof(request.nbdrequest.handle));
-			ewrite(localrequestsocket, &reply.myreply.nbdreply,
-					sizeof(reply.myreply.nbdreply));
+			nbdreply(localrequestsocket, &reply.nbdreply,
+					sizeof(reply.nbdreply), NULL, 0);
+//			ewrite(localrequestsocket, &reply.myreply.nbdreply,
+//					sizeof(reply.myreply.nbdreply));
 			break;
 		}
 		case HTONL(NBD_CMD_TRIM): {
@@ -773,13 +841,19 @@ void *process_requests(void *unused) {
 				}
 			}
 			//...
-			reply.myreply.nbdreply.error = HTONL(0);
-			memcpy(reply.myreply.nbdreply.handle, request.nbdrequest.handle,
+			reply.nbdreply.error = HTONL(0);
+			_Static_assert(
+					sizeof(reply.nbdreply.handle)
+							== sizeof(request.nbdrequest.handle),
+					"if this fails, the code needs to get updated.");
+			memcpy(reply.nbdreply.handle, request.nbdrequest.handle,
 					sizeof(request.nbdrequest.handle));
 //			*(uint64_t*) reply.myreply.nbdreply.handle =
 //					*(uint64_t*) request.nbdrequest.handle;
-			ewrite(localrequestsocket, &reply.myreply.nbdreply,
-					sizeof(reply.myreply.nbdreply));
+			nbdreply(localrequestsocket, (const char*) &reply.nbdreply,
+					sizeof(reply.nbdreply), NULL, 0);
+//			ewrite(localrequestsocket, &reply.myreply.nbdreply,
+//					sizeof(reply.myreply.nbdreply));
 			break;
 		}
 		default: {
@@ -787,6 +861,7 @@ void *process_requests(void *unused) {
 			//implement NBD_CMD_STRUCTURED_REPLY? same as above
 			//implement NBD_CMD_INFO ? same as above
 			//implement NBD_CMD_CACHE ? same as above
+			//send EINVAL?
 			print_request_data(&request);
 			myerror(EXIT_FAILURE, errno,
 					"got a request type i did not understand!: %ul (see the source code for a list of requests i DO understand, in the switch case's)",
@@ -796,7 +871,7 @@ void *process_requests(void *unused) {
 		}
 		}
 	}
-	//is_shutting_down should be true at this point
+//is_shutting_down should be true at this point
 	--num_workerthreads;
 	curl_easy_cleanup(curlh);
 	return NULL;
@@ -828,6 +903,10 @@ void init_mutexes(void) {
 	if (unlikely(err != 0)) {
 		myerror(EXIT_FAILURE, err,
 				"failed to initialize mutex alter_num_workerthreads_mutex!\n");
+	}
+	err = pthread_mutex_init(&replymutex, NULL);
+	if (unlikely(err != 0)) {
+		myerror(EXIT_FAILURE, err, "failed to initialize mutex replymutex!\n");
 	}
 }
 #define ARGV_NBD argv[1]
@@ -970,8 +1049,7 @@ int main(int argc, char *argv[]) {
 			//to put things in perspective, if the size of a pointer is 8 bytes (64bit), we can now hold 131,072 pointers.
 			// (default on my system is 8 meg)
 			err = pthread_attr_setstacksize(&worker_attributes,
-					(1 * 1024 * 1024)
-							+ sizeof(((struct myreply*) NULL)->buffer));
+					(1 * 1024 * 1024));
 			if (unlikely(err != 0)) {
 				myerror(EXIT_FAILURE, err, "failed to set worker stack size! ");
 			}
