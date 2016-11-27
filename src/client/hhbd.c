@@ -416,7 +416,7 @@ struct myrequest {
 	struct nbd_request nbdrequest;
 	struct mybuffer mybuf;
 };
-void print_request_data(struct myrequest *request) {
+void print_request_data(const struct myrequest *request) {
 	printf("request->magic: %i\n", ntohl(request->nbdrequest.magic));
 	printf("request->type: %i\n", ntohl(request->nbdrequest.type));
 	{
