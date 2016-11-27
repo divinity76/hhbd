@@ -596,8 +596,10 @@ void *process_requests(void *unused) {
 	ecurl_easy_setopt(curlh, CURLOPT_USERAGENT, "curl/7.50.1");
 	ecurl_easy_setopt(curlh, CURLOPT_MAXREDIRS, 50L);
 	//optimize note: tls might make a huge overhead for the workers...
+	//benchmarking has shown that, for unknown reasons,
+	//CURL_HTTP_VERSION_1_0 is faster than both CURL_HTTP_VERSION_1_1 and CURL_HTTP_VERSION_2TLS...
 	ecurl_easy_setopt(curlh, CURLOPT_HTTP_VERSION,
-			(long )CURL_HTTP_VERSION_2TLS);
+			(long )CURL_HTTP_VERSION_1_0);
 	//ecurl_easy_setopt(curlh, CURLOPT_SSH_KNOWNHOSTS, "/root/.ssh/known_hosts");
 	{
 		//unsafe options
