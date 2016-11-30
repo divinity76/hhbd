@@ -35,7 +35,6 @@
 #include <assert.h>
 #include <time.h>
 #include <curl/curl.h>
-
 #include "misc.h"
 #include "misc_extra.h"
 #include "hhbd.h"
@@ -45,6 +44,7 @@
 // ( https://www.kernel.org/doc/Documentation/unaligned-memory-access.txt )
 // fix that sometime... (this is all theoretical. i don't have such a platform to test on...)
 //#include <asm/unaligned.h>
+#define GETDATA_REQUESTSOCKET
 
 _Static_assert(sizeof(intptr_t)<=sizeof(void*),"due to SO_LINGER thread optimizations, "
 		"this code currently requires that sizeof(intptr_t) <=sizeof(void*), which "
@@ -59,6 +59,7 @@ struct {
 //maybe make this runtime defined sometime.
 #define CompileTimeDefinedNumberOfWriteSockets 10
 #define CompileTimeDefinedMaxNumberOfBlocksPerKernelRequest 1000
+#define CompileTimeDefinedRWSocketExpireSeconds 150
 struct {
 	time_t closes_after_ts;
 	int sock;
@@ -79,7 +80,7 @@ struct {
 	char requestWriteSocketUrl[255];
 	char readurl[255];
 	char myIP[255];
-	uint16_t myport;
+//	uint16_t myport;
 }volatile serverinfo = { 0 };
 void getServerInfo(const char* infourl) {
 	static volatile bool isRequestingInfo = false;
@@ -107,10 +108,9 @@ void getServerInfo(const char* infourl) {
 	char *myIP_escaped = ecurl_easy_escape(curlh, (const char*) serverinfo.myIP,
 			(int) strlen((const char*) serverinfo.myIP));
 	char *infoRequestUrl = emalloc(
-			(size_t) snprintf(NULL, 0, "%s?ip=%s&port=%" PRIu16,
-					serverinfo.infourl, myIP_escaped, serverinfo.myport) + 1);
-	sprintf(infoRequestUrl, "%s?ip=%s&port=%" PRIu16, serverinfo.infourl,
-			myIP_escaped, serverinfo.myport);
+			(size_t) snprintf(NULL, 0, "%s?ip=%s&port=", serverinfo.infourl,
+					myIP_escaped) + 1);
+	sprintf(infoRequestUrl, "%s?ip=%s&port=", serverinfo.infourl, myIP_escaped);
 	curl_free(myIP_escaped);
 	ecurl_easy_setopt(curlh, CURLOPT_URL, infoRequestUrl);
 	ecurl_easy_setopt(curlh, CURLOPT_NOPROGRESS, 1L);
@@ -139,6 +139,7 @@ void getServerInfo(const char* infourl) {
 	}
 	{
 		rewind(result);
+		//TODO: requestWriteUrl now must end with port=  , so should verify that it does...
 		int ret =
 				fscanf(result,
 						"hhbd OK\nreadurl:%254s\nrequestWriteSocketUrl:%254s\ntotalSize:%zu\n",
@@ -406,16 +407,165 @@ struct mybuffer {
 	size_t buffer_size;
 	char* buffer;
 };
+struct myrequest {
+	struct nbd_request nbdrequest;
+	struct mybuffer mybuf;
+};
 struct myreply {
 	struct nbd_reply nbdreply __attribute((packed));
 	struct mybuffer mybuf;
 	size_t write_pos;
 };
 
-struct myrequest {
-	struct nbd_request nbdrequest;
-	struct mybuffer mybuf;
+struct readwritesocket {
+	int sock;
+	time_t expire;
+//	bool expired;
 };
+//guess i could use as struct rwsocketrequest *rwrequest=(void*)(&reply->handle[7]);
+struct rwsocketrequest {
+	uint8_t type;
+	uint64_t from;
+	uint32_t len;
+}__attribute((packed));
+void refreshrwsocket(struct readwritesocket *rwsocket, CURL *curlh,
+		struct myreply *reply) {
+	//likely because in theory it will just be false once per worker for the lifetime of the process... which i guess still isn't optimal but whatever
+	if (likely(rwsocket->sock != 0)) {
+		int err = close(rwsocket->sock);
+		if (unlikely(err == -1)) {
+			myerror(0, errno,
+					"Warning: refreshrwsocket failed to close the old socket");
+			//EBADF: fd isn't a valid open file descriptor.
+			if (errno != EBADF) {
+				err = close(rwsocket->sock);
+				if (unlikely(err == -1)) {
+					//....
+					myerror(EXIT_FAILURE, errno,
+							"ERROR: refreshrwsocket is unable to close a socket! in the interest of not leaking system resources in a loop, terminating");
+				}
+			}
+		}
+	}
+	int tcpsocket = socket(AF_INET, SOCK_STREAM, 0);
+	if (unlikely(tcpsocket == -1)) {
+		myerror(EXIT_FAILURE, errno, "failed to create tcpsock!\n");
+	}
+	{
+		int err = listen(tcpsocket, 2);
+		if (unlikely(err == -1)) {
+			myerror(EXIT_FAILURE, errno,
+					"ERROR: refreshrwsocket is unable to listen a socket!\n");
+		}
+	}
+	uint16_t port;
+	{
+		struct sockaddr_in addr;
+		socklen_t addrlen = sizeof(addr);
+		int err = getsockname(tcpsocket, (struct sockaddr*) &addr, &addrlen);
+		if (unlikely(err == -1 || addrlen > sizeof(addr))) {
+			myerror(EXIT_FAILURE, errno,
+					"ERROR: refreshrwsocket fails to get the port bound to the new socket!\n");
+		}
+		port = ntohs(addr.sin_port);
+	}
+	//sizeof("str") includes null terminator
+	char getSocketUrl[strlen((char*) serverinfo.requestWriteSocketUrl)
+			+ sizeof("65535")];
+	sprintf(getSocketUrl, "%s%" PRIu16, serverinfo.requestWriteSocketUrl, port);
+	ecurl_easy_setopt(curlh, CURLOPT_URL, getSocketUrl);
+	while (1) {
+		reply->write_pos = 0;
+		//ecurl_easy_setopt(curlh, CURLOPT_VERBOSE, 1L);
+		CURLcode ret = curl_easy_perform(curlh);
+		if (unlikely(ret != CURLE_OK)) {
+			myerror(0, errno,
+					"refreshrwsocket curl failed to fetch %s. CURLcode: %i. curl_easy_strerror: %s.\nwill try again..\n",
+					getSocketUrl, ret, curl_easy_strerror(ret));
+			continue;
+		}
+		long httpret;
+		ecurl_easy_getinfo(curlh, CURLINFO_RESPONSE_CODE, &httpret);
+		if (unlikely(httpret != 201)) {
+			myerror(0, errno,
+					"refreshrwsocket curl did not get the expected HTTP 201 CREATED, but got %li  on %s. \nwill try again after printing recived data (%zu bytes): \n",
+					httpret, getSocketUrl, reply->write_pos);
+			fwrite(reply->mybuf.buffer, reply->write_pos, 1, stderr);
+			fprintf(stderr, "\n");
+			continue;
+		}
+		//we use the 201 response code as validation.. should probably make a stronger validation scheme..
+		break;
+	}
+#ifdef DEBUG
+	printf("waiting for socket..\n");
+#endif
+	while (1) {
+		int conn = accept(tcpsocket, NULL, NULL);
+		if (unlikely(conn == -1)) {
+			if (likely(errno == ECONNABORTED || errno == EPROTO)) {
+				myerror(0, errno,
+						"(probably ignorable connection abort or tcp protocol error, i guess it was a portscanner. will try another connection)\n");
+				continue;
+			} else {
+				myerror(EXIT_FAILURE, errno,
+						"refreshrwsocket failed to accept a connection!");
+				UNREACHABLE();
+			}
+		}
+		{
+			//30 was chosen because in the ascii table, 30 means "record separator"
+			uint8_t init_byte;
+			//FIXME: there is a DoS vulnerability here with just opening a socket and keeping quiet
+			// MSG_WAITALL may block indefinitely...
+			ssize_t read = recv(conn, &init_byte, sizeof(init_byte),
+			MSG_WAITALL);
+			if (unlikely(read == -1)) {
+				myerror(0, errno,
+						"Warning: refreshrwsocket recv failed to receive init_byte byte due to an error.. will try another connection");
+				int err = close(conn);
+				if (unlikely(err == -1)) {
+					//sigh, not sure what to do
+					close(conn);
+				}
+				continue;
+			}
+			if (unlikely(read != sizeof(init_byte) || 30 != init_byte)) {
+				myerror(0, errno,
+						"Warning: refreshrwsocket recv got the wrong init_byte! trying another connection");
+				int err = close(conn);
+				if (unlikely(err == -1)) {
+					//sigh, not sure what to do
+					close(conn);
+				}
+				continue;
+			}
+		}
+#ifdef DEBUG
+		printf("got socket!\n");
+#endif
+		rwsocket->sock = conn;
+		rwsocket->expire = time(NULL) + CompileTimeDefinedRWSocketExpireSeconds;
+		break;
+	}
+
+	{
+		int err = close(tcpsocket);
+		if (unlikely(err == -1)) {
+			if (errno == EINTR || errno == EIO) {
+				err = close(tcpsocket);
+			}
+			if (unlikely(err == -1)) {
+				//...
+				myerror(EXIT_FAILURE, errno,
+						"refreshrwsocket fails to close listen socket! port: %" PRIu16 "\n",
+						port);
+			}
+		}
+	}
+	return;
+}
+
 void print_request_data(const struct myrequest *request) {
 	printf("request->magic: %i\n", ntohl(request->nbdrequest.magic));
 	printf("request->type: %i\n", ntohl(request->nbdrequest.type));
@@ -426,6 +576,7 @@ void print_request_data(const struct myrequest *request) {
 		memcpy(&nhandle, request->nbdrequest.handle, sizeof(nhandle));
 		printf("request->handle: %zu\n", ntohll(nhandle));
 	}
+
 	printf("request->from: %zu\n", ntohll(request->nbdrequest.from));
 	printf("request->len: %ul\n", ntohl(request->nbdrequest.len));
 }
@@ -455,44 +606,59 @@ void print_request_data(const struct myrequest *request) {
 //	}
 //}
 
-ssize_t ewrite2(const int fd, const struct iovec iov) {
-	struct msghdr header;
-	//header.msg_name=NULL;
-	header.msg_namelen = 0;
-	header.msg_iov = (struct iovec*) &iov;
-	header.msg_iovlen = 1;
-	//header.msg_control=NULL;
-	header.msg_controllen = 0;
-	// some time in the future, it wouldn't surprise me if
-	// msg_flags were no longer ignored.
-	// after which, msg_flags would need to be initialized...
-	// but ever since sendmsg was introduced, and to kernel 4.8, this is not the case..
-	// and afaik, it wont be the case any time in the near future...
-	// thus, as it currently stands, initializing it is a waste of cpu...
-	header.msg_flags = 0;
-	const ssize_t ret = sendmsg(fd, &header, 0);
-	if (unlikely(ret != iov.iov_len)) {
-		myerror(EXIT_FAILURE, errno,
-				"failed to sendmsg() all data! tried to write %zu bytes, but could only write %zd bytes!",
-				iov.iov_len, ret);
+//ssize_t ewrite2(const int fd, const struct iovec iov) {
+//	struct msghdr header;
+//	//header.msg_name=NULL;
+//	header.msg_namelen = 0;
+//	header.msg_iov = (struct iovec*) &iov;
+//	header.msg_iovlen = 1;
+//	//header.msg_control=NULL;
+//	header.msg_controllen = 0;
+//	// some time in the future, it wouldn't surprise me if
+//	// msg_flags were no longer ignored.
+//	// after which, msg_flags would need to be initialized...
+//	// but ever since sendmsg was introduced, and to kernel 4.8, this is not the case..
+//	// and afaik, it wont be the case any time in the near future...
+//	// thus, as it currently stands, initializing it is a waste of cpu...
+//	header.msg_flags = 0;
+//	const ssize_t ret = sendmsg(fd, &header, 0);
+//	if (unlikely(ret != iov.iov_len)) {
+//		myerror(EXIT_FAILURE, errno,
+//				"failed to sendmsg() all data! tried to write %zu bytes, but could only write %zd bytes!",
+//				iov.iov_len, ret);
+//	}
+//	return ret;
+//}
+//ssize_t ewrite(const int fd, const void *buf, const size_t count) {
+//	const ssize_t ret = write(fd, buf, count);
+//	if (unlikely(ret != (ssize_t )count)) {
+//		myerror(EXIT_FAILURE, errno,
+//				"failed to write() all data! tried to write %zu bytes, but could only write %zd bytes!",
+//				count, ret);
+//	}
+//	return ret;
+//}
+
+void writeall(const int fd, const void *buf, const size_t bufsize) {
+	if (unlikely(bufsize < 1)) {
+		return;
 	}
-	return ret;
-}
-ssize_t ewrite(const int fd, const void *buf, const size_t count) {
-	const ssize_t ret = write(fd, buf, count);
-	if (unlikely(ret != (ssize_t )count)) {
-		myerror(EXIT_FAILURE, errno,
-				"failed to write() all data! tried to write %zu bytes, but could only write %zd bytes!",
-				count, ret);
-	}
-	return ret;
+	size_t written_total = 0;
+	do {
+		const ssize_t written = write(fd, &(((const char*) buf)[written_total]),
+				bufsize - written_total);
+		if (unlikely(written < 0)) {
+			myerror(EXIT_FAILURE, errno, "writeall write returned <0!!\n");
+		}
+		written_total += (size_t) written;
+	} while (written_total < bufsize);
+
 }
 pthread_mutex_t replymutex;
 void nbdreply(const int fd, const void *buf1, const size_t buf1_size,
 		const void *buf2, const size_t buf2_size) {
 	{
-		int err;
-		err = pthread_mutex_lock(&replymutex);
+		const int err = pthread_mutex_lock(&replymutex);
 		if (unlikely(err != 0)) {
 			myerror(EXIT_FAILURE, err, "reply failed to lock replymutex!\n");
 		}
@@ -501,23 +667,25 @@ void nbdreply(const int fd, const void *buf1, const size_t buf1_size,
 	if (likely(buf1_size > 0)) {
 		size_t written_total = 0;
 		do {
-			ssize_t written = write(fd, &(((const char*) buf1)[written_total]),
+			const ssize_t written = write(fd,
+					&(((const char*) buf1)[written_total]),
 					buf1_size - written_total);
 			if (unlikely(written < 0)) {
 				myerror(EXIT_FAILURE, errno, "nbdreply write returned <0!!\n");
 			}
-			written_total += written;
+			written_total += (size_t) written;
 		} while (written_total < buf1_size);
 	}
 	if (likely(buf2_size > 0)) {
 		size_t written_total = 0;
 		do {
-			ssize_t written = write(fd, &(((const char*) buf2)[written_total]),
+			const ssize_t written = write(fd,
+					&(((const char*) buf2)[written_total]),
 					buf2_size - written_total);
 			if (unlikely(written < 0)) {
 				myerror(EXIT_FAILURE, errno, "nbdreply write returned <0!!\n");
 			}
-			written_total += written;
+			written_total += (size_t) written;
 		} while (written_total < buf2_size);
 	}
 	{
@@ -569,6 +737,28 @@ if (unlikely(realbuffer.buffer_size < minsize)) { \
 } \
 };
 
+void getdata_requestsocket(const struct readwritesocket *rwsock,
+		struct myrequest *request) {
+	struct rwsocketrequest *sockrequest =
+			(void*) &(request->nbdrequest.handle[sizeof(request->nbdrequest.handle)
+					- 1]);
+	sockrequest->type = 1;			//1=READ...
+	const uint32_t len = sockrequest->len;
+	sockrequest->len = htonl(sockrequest->len);
+	//sockrequest->from is big endian already (from the kernel)
+	_Static_assert(sizeof(*sockrequest) == 13, "foo");
+	writeall(rwsock->sock, sockrequest, sizeof(*sockrequest));
+//	printf("sent off read request for %zd bytes!\n", len);
+	ssize_t read = recv(rwsock->sock, request->mybuf.buffer, len, MSG_WAITALL);
+	if (unlikely(read != (ssize_t )len)) {
+		myerror(EXIT_FAILURE, errno,
+				"getdata_requestsocket failed to get the response to a read request! tried to read %zu/%ul\n",
+				read, len);
+	}
+	request->nbdrequest.len = len;
+	return;
+}
+
 void *process_requests(void *unused) {
 	(void) unused;
 	//volatile global variables often cannot be held in cpu registers (for long), and thus are more difficult to optimize.
@@ -577,7 +767,8 @@ void *process_requests(void *unused) {
 	//optimization note: add POSIX_MADV_SEQUENTIAL to request.buffer and reply?
 	struct myrequest request = { 0 };
 	struct myreply reply = { 0 };
-	struct mybuffer realbuffer = { 0 };	//<not a performance critical piece of code..
+	struct mybuffer realbuffer = { 0 };
+	struct readwritesocket rwsock = { 0 };
 	//32 is NOT random. its the highest i've ever seen from my own local amd64 system.
 	//the kernel first try blocksize*4. if i return EINVAL, it tries blocksize*1, but if success,
 	//it tries blocksize*8, then blocksize*16 , then blocksize*32
@@ -590,28 +781,32 @@ void *process_requests(void *unused) {
 	reply.nbdreply.magic = HTONL(NBD_REPLY_MAGIC);
 	reply.nbdreply.error = HTONL(0);
 	CURL *curlh = ecurl_easy_init();
-	ecurl_easy_setopt(curlh, CURLOPT_URL, (const char* )serverinfo.readurl);
-	ecurl_easy_setopt(curlh, CURLOPT_NOPROGRESS, 1L);
-	//ecurl_easy_setopt(curlh, CURLOPT_HEADER, 0L);
-	ecurl_easy_setopt(curlh, CURLOPT_USERAGENT, "curl/7.50.1");
-	ecurl_easy_setopt(curlh, CURLOPT_MAXREDIRS, 50L);
-	//optimize note: tls might make a huge overhead for the workers...
-	//benchmarking has shown that, for unknown reasons,
-	//CURL_HTTP_VERSION_1_0 is faster than both CURL_HTTP_VERSION_1_1 and CURL_HTTP_VERSION_2TLS...
-	ecurl_easy_setopt(curlh, CURLOPT_HTTP_VERSION,
-			(long )CURL_HTTP_VERSION_1_0);
-	//ecurl_easy_setopt(curlh, CURLOPT_SSH_KNOWNHOSTS, "/root/.ssh/known_hosts");
 	{
-		//unsafe options
-		ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYHOST, 0L);
-		ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYPEER, 0L);
-		ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYSTATUS, 0L);
+		ecurl_easy_setopt(curlh, CURLOPT_URL, (const char* )serverinfo.readurl);
+		ecurl_easy_setopt(curlh, CURLOPT_NOPROGRESS, 1L);
+		//ecurl_easy_setopt(curlh, CURLOPT_HEADER, 0L);
+		ecurl_easy_setopt(curlh, CURLOPT_USERAGENT, "curl/7.50.1");
+		ecurl_easy_setopt(curlh, CURLOPT_MAXREDIRS, 50L);
+		//optimize note: tls might make a huge overhead for the workers...
+		//benchmarking has shown that, for unknown reasons,
+		//CURL_HTTP_VERSION_1_0 is faster than both CURL_HTTP_VERSION_1_1 and CURL_HTTP_VERSION_2TLS...
+//		ecurl_easy_setopt(curlh, CURLOPT_HTTP_VERSION,
+//				(long )CURL_HTTP_VERSION_1_0);
+		//ecurl_easy_setopt(curlh, CURLOPT_SSH_KNOWNHOSTS, "/root/.ssh/known_hosts");
+		{
+			//unsafe options
+			ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYHOST, 0L);
+			ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYPEER, 0L);
+			ecurl_easy_setopt(curlh, CURLOPT_SSL_VERIFYSTATUS, 0L);
+		}
+		ecurl_easy_setopt(curlh, CURLOPT_WRITEDATA, &reply);
+		ecurl_easy_setopt(curlh, CURLOPT_WRITEFUNCTION,
+				curl_myreply_writer_callback);
+		// not sure if i should ecurl_easy_setopt(curlh, CURLOPT_BUFFERSIZE, blocksize);
+		//should i set CURLOPT_MAXFILESIZE ?
 	}
-	ecurl_easy_setopt(curlh, CURLOPT_WRITEDATA, &reply);
-	ecurl_easy_setopt(curlh, CURLOPT_WRITEFUNCTION,
-			curl_myreply_writer_callback);
-	// not sure if i should ecurl_easy_setopt(curlh, CURLOPT_BUFFERSIZE, blocksize);
-	//should i set CURLOPT_MAXFILESIZE ?
+	refreshrwsocket(&rwsock, curlh, &reply);
+
 	++num_workerthreads;
 	while (1) {
 		{
@@ -638,8 +833,8 @@ void *process_requests(void *unused) {
 			reply.nbdreply.error = HTONL(ESHUTDOWN);
 			memcpy(reply.nbdreply.handle, request.nbdrequest.handle,
 					sizeof(request.nbdrequest.handle));
-			send(localrequestsocket, &reply.nbdreply, sizeof(reply.nbdreply),
-					0);
+			nbdreply(localrequestsocket, &reply.nbdreply,
+					sizeof(reply.nbdreply), NULL, 0);
 			int err = pthread_mutex_unlock(&process_request_mutex);
 			if (unlikely(err != 0)) {
 				myerror(EXIT_FAILURE, err,
@@ -680,8 +875,8 @@ void *process_requests(void *unused) {
 							"Failed to unlock process_request_mutex!\n");
 				}
 			}
-			request.nbdrequest.len = ntohl(request.nbdrequest.len);
-			request.nbdrequest.from = ntohll(request.nbdrequest.from);
+			//request.nbdrequest.from = ntohll(request.nbdrequest.from);
+
 			_Static_assert(
 					sizeof(reply.nbdreply.handle)
 							== sizeof(request.nbdrequest.handle),
@@ -707,14 +902,21 @@ void *process_requests(void *unused) {
 			// EVER will request to read 0 bytes. but IF, against expectation, it ever does,
 			// the code inside would fail.
 			// (rangebuf would contain an invalid range for CURLOPT_RANGE. invalid range per the http specifications. etc)
-			if (likely(request.nbdrequest.len > 0)) {
+			if (likely(request.nbdrequest.len != HTONL(0))) {
+				request.nbdrequest.len = ntohl(request.nbdrequest.len);
 				REALBUF_MINSIZE(request.nbdrequest.len);
+#ifdef GETDATA_REQUESTSOCKET
+				if (time(NULL) >= rwsock.expire) {
+					refreshrwsocket(&rwsock, curlh, &reply);
+				}
+				getdata_requestsocket(&rwsock, &request);
+#elif defined(GETDATA_HTTPCURL)
 				//string(39) "9223372036854775807-9223372036854775807"
 				char rangebuf[40];
 				sprintf(rangebuf, "%" PRIu64 "-%" PRIu64,
 						(uint64_t) request.nbdrequest.from,
 						(uint64_t) ((request.nbdrequest.from
-								+ request.nbdrequest.len) - 1));
+										+ request.nbdrequest.len) - 1));
 				ecurl_easy_setopt(curlh, CURLOPT_RANGE, rangebuf);
 				long httpresponse;
 				CURLcode err;
@@ -733,7 +935,10 @@ void *process_requests(void *unused) {
 								curl_easy_strerror(err), httpresponse);
 						fflush(stderr);
 					}
-				} while (unlikely(err != CURLE_OK || httpresponse != 206));
+				}while (unlikely(err != CURLE_OK || httpresponse != 206));
+#else
+#error no method to GET data defined!
+#endif
 			}
 			{
 				reply.nbdreply.error = HTONL(0);
@@ -852,7 +1057,7 @@ void *process_requests(void *unused) {
 					sizeof(request.nbdrequest.handle));
 //			*(uint64_t*) reply.myreply.nbdreply.handle =
 //					*(uint64_t*) request.nbdrequest.handle;
-			nbdreply(localrequestsocket, (const char*) &reply.nbdreply,
+			nbdreply(localrequestsocket, &reply.nbdreply,
 					sizeof(reply.nbdreply), NULL, 0);
 //			ewrite(localrequestsocket, &reply.myreply.nbdreply,
 //					sizeof(reply.myreply.nbdreply));
@@ -928,9 +1133,9 @@ int main(int argc, char *argv[]) {
 	init_mutexes();
 	atexit(exit_global_cleanup);
 	installShutdownSignalHandlers();
-	if (argc - 1 != 5) {
+	if (argc - 1 != 4) {
 		myerror(EXIT_FAILURE, EINVAL,
-				"wrong number of input arguments.\n need 5, got %i\n usage: %s /dev/nbdX number_of_threads http://example.org/foo/serverinfo.php MyGlobalHostNameOrIP portnum\n",
+				"wrong number of input arguments.\n need 4, got %i\n usage: %s /dev/nbdX number_of_threads http://example.org/foo/serverinfo.php MyGlobalHostNameOrIP\n",
 				argc - 1, argv[0]);
 	}
 	kernelIPC.nbd_fd = open(ARGV_NBD, O_RDWR);
@@ -962,19 +1167,19 @@ int main(int argc, char *argv[]) {
 		}
 		strcpy((char*) serverinfo.myIP, ARGV_MYIP);
 	}
-	{
-		if (unlikely(1!=sscanf(ARGV_MYPORT,"%" SCNu16, &serverinfo.myport))) {
-			myerror(EXIT_FAILURE, EINVAL,
-					"failed to parse argument 5 (myport) as an unsigned 16 bit integer!: %s\n",
-					ARGV_MYPORT);
-		}
-		if (unlikely(serverinfo.myport == 0)) {
-			myerror(EXIT_FAILURE, EINVAL,
-					"argument 5 (myport) CAN NOT BE 0. if i request port 0, the kernel will "
-							"do funny stuff and give me a random port! not programmed for that.\n");
-		}
-
-	}
+//	{
+//		if (unlikely(1!=sscanf(ARGV_MYPORT,"%" SCNu16, &serverinfo.myport))) {
+//			myerror(EXIT_FAILURE, EINVAL,
+//					"failed to parse argument 5 (myport) as an unsigned 16 bit integer!: %s\n",
+//					ARGV_MYPORT);
+//		}
+//		if (unlikely(serverinfo.myport == 0)) {
+//			myerror(EXIT_FAILURE, EINVAL,
+//					"argument 5 (myport) CAN NOT BE 0. if i request port 0, the kernel will "
+//							"do funny stuff and give me a random port! not programmed for that.\n");
+//		}
+//
+//	}
 	getServerInfo(ARGV_SERVERINFO);
 	{
 		int socks[2];
@@ -1084,7 +1289,8 @@ int main(int argc, char *argv[]) {
 	CompileTimeDefinedNumberOfWriteSockets);
 	printf("CompileTimeDefinedMaxNumberOfBlocksPerKernelRequest: %i\n",
 	CompileTimeDefinedMaxNumberOfBlocksPerKernelRequest);
-
+	printf("CompileTimeDefinedRWSocketExpireSeconds: %i\n",
+	CompileTimeDefinedRWSocketExpireSeconds);
 	printf(
 			"main thread has finished. will sleep until a signal is received. (by issuing pause();...)\n");
 	fflush(stdout);
