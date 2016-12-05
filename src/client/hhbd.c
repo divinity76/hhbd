@@ -46,9 +46,6 @@
 //#include <asm/unaligned.h>
 #define GETDATA_REQUESTSOCKET
 
-_Static_assert(sizeof(intptr_t)<=sizeof(void*),"due to SO_LINGER thread optimizations, "
-		"this code currently requires that sizeof(intptr_t) <=sizeof(void*), which "
-		"is generally true, but not guaranteed by C specs... (easy to fix but would result in slower code)");
 
 struct {
 	int nbd_fd;
@@ -580,119 +577,57 @@ void print_request_data(const struct myrequest *request) {
 	printf("request->from: %zu\n", ntohll(request->nbdrequest.from));
 	printf("request->len: %ul\n", ntohl(request->nbdrequest.len));
 }
-
-//void ewrite3(const int sockfd, const struct iovec iov) {
-//	struct mmsghdr header;
-//	header.msg_len = 1;
-//
-//	//header.msg_name=NULL;
-//	header.msg_hdr.msg_namelen = 0;
-//	header.msg_hdr.msg_iov = (struct iovec*) &iov;
-//	header.msg_hdr.msg_iovlen = 1;
-//	//header.msg_control=NULL;
-//	header.msg_hdr.msg_controllen = 0;
-//	// some time in the future, it wouldn't surprise me if
-//	// msg_flags were no longer ignored.
-//	// after which, msg_flags would need to be initialized...
-//	// but ever since sendmsg was introduced, and to kernel 4.8, this is not the case..
-//	// and afaik, it wont be the case any time in the near future...
-//	// thus, as it currently stands, initializing it is a waste of cpu...
-//	header.msg_hdr.msg_flags = 0;
-//	const int sent1 = sendmmsg(sockfd, &header, 1, 0);
-//	if (unlikely(sent1 != 1)) {
-//		myerror(EXIT_FAILURE, errno,
-//				"failed to sendmsg() all data! tried to write %zu bytes. sendmmsg() was supposed to return 1, but returned %i\n",
-//				iov.iov_len, sent1);
-//	}
-//}
-
-//ssize_t ewrite2(const int fd, const struct iovec iov) {
-//	struct msghdr header;
-//	//header.msg_name=NULL;
-//	header.msg_namelen = 0;
-//	header.msg_iov = (struct iovec*) &iov;
-//	header.msg_iovlen = 1;
-//	//header.msg_control=NULL;
-//	header.msg_controllen = 0;
-//	// some time in the future, it wouldn't surprise me if
-//	// msg_flags were no longer ignored.
-//	// after which, msg_flags would need to be initialized...
-//	// but ever since sendmsg was introduced, and to kernel 4.8, this is not the case..
-//	// and afaik, it wont be the case any time in the near future...
-//	// thus, as it currently stands, initializing it is a waste of cpu...
-//	header.msg_flags = 0;
-//	const ssize_t ret = sendmsg(fd, &header, 0);
-//	if (unlikely(ret != iov.iov_len)) {
-//		myerror(EXIT_FAILURE, errno,
-//				"failed to sendmsg() all data! tried to write %zu bytes, but could only write %zd bytes!",
-//				iov.iov_len, ret);
-//	}
-//	return ret;
-//}
-//ssize_t ewrite(const int fd, const void *buf, const size_t count) {
-//	const ssize_t ret = write(fd, buf, count);
-//	if (unlikely(ret != (ssize_t )count)) {
-//		myerror(EXIT_FAILURE, errno,
-//				"failed to write() all data! tried to write %zu bytes, but could only write %zd bytes!",
-//				count, ret);
-//	}
-//	return ret;
-//}
-
 void writeall(const int fd, const void *buf, const size_t bufsize) {
-	if (unlikely(bufsize < 1)) {
-		return;
-	}
 	size_t written_total = 0;
-	do {
+	while (written_total < bufsize) {
 		const ssize_t written = write(fd, &(((const char*) buf)[written_total]),
 				bufsize - written_total);
 		if (unlikely(written < 0)) {
 			myerror(EXIT_FAILURE, errno, "writeall write returned <0!!\n");
 		}
 		written_total += (size_t) written;
-	} while (written_total < bufsize);
-
+	}
 }
-pthread_mutex_t replymutex;
+pthread_mutex_t nbdreplymutex;
 void nbdreply(const int fd, const void *buf1, const size_t buf1_size,
 		const void *buf2, const size_t buf2_size) {
 	{
-		const int err = pthread_mutex_lock(&replymutex);
+		const int err = pthread_mutex_lock(&nbdreplymutex);
 		if (unlikely(err != 0)) {
-			myerror(EXIT_FAILURE, err, "reply failed to lock replymutex!\n");
+			myerror(EXIT_FAILURE, err, "reply failed to lock nbdreplymutex!\n");
 		}
 	}
 
-	if (likely(buf1_size > 0)) {
+	{
 		size_t written_total = 0;
-		do {
+		while (written_total < buf1_size) {
 			const ssize_t written = write(fd,
 					&(((const char*) buf1)[written_total]),
 					buf1_size - written_total);
 			if (unlikely(written < 0)) {
-				myerror(EXIT_FAILURE, errno, "nbdreply write returned <0!!\n");
+				myerror(EXIT_FAILURE, errno, "nbdreply write 1 returned <0!!\n");
 			}
 			written_total += (size_t) written;
-		} while (written_total < buf1_size);
+		}
 	}
-	if (likely(buf2_size > 0)) {
+	{
 		size_t written_total = 0;
-		do {
+		while (written_total < buf2_size) {
 			const ssize_t written = write(fd,
 					&(((const char*) buf2)[written_total]),
 					buf2_size - written_total);
 			if (unlikely(written < 0)) {
-				myerror(EXIT_FAILURE, errno, "nbdreply write returned <0!!\n");
+				myerror(EXIT_FAILURE, errno, "nbdreply write 2 returned <0!!\n");
 			}
 			written_total += (size_t) written;
-		} while (written_total < buf2_size);
+		}
 	}
 	{
 		int err;
-		err = pthread_mutex_unlock(&replymutex);
+		err = pthread_mutex_unlock(&nbdreplymutex);
 		if (unlikely(err != 0)) {
-			myerror(EXIT_FAILURE, err, "reply failed to unlock replymutex!\n");
+			myerror(EXIT_FAILURE, err,
+					"reply failed to unlock nbdreplymutex!\n");
 		}
 	}
 	return;
@@ -1111,7 +1046,7 @@ void init_mutexes(void) {
 		myerror(EXIT_FAILURE, err,
 				"failed to initialize mutex alter_num_workerthreads_mutex!\n");
 	}
-	err = pthread_mutex_init(&replymutex, NULL);
+	err = pthread_mutex_init(&nbdreplymutex, NULL);
 	if (unlikely(err != 0)) {
 		myerror(EXIT_FAILURE, err, "failed to initialize mutex replymutex!\n");
 	}
